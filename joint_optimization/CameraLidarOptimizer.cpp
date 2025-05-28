@@ -29,16 +29,29 @@ CameraLidarOptimizer::CameraLidarOptimizer(const Eigen::Matrix4f _T_cl, const st
     T_cl_init = _T_cl.cast<double>();
 }
 
+// 这个函数用于优化相机和激光雷达之间的外参标定
+// 输入参数:
+// - line_pairs: 图像和激光雷达之间匹配的直线对,每个直线对包含一条图像直线和一条激光雷达直线
+// - T_cl: 初始的相机到激光雷达的变换矩阵
 int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>>&line_pairs, 
                         const Eigen::Matrix4d& T_cl)
 {
+    // 创建ceres优化问题
     ceres::Problem problem;
+    // 使用Huber损失函数,阈值为2度
     ceres::LossFunction *  loss_function = new ceres::HuberLoss(2.0 * M_PI / 180.0);
+    
+    // 从变换矩阵中提取旋转矩阵和平移向量
     Eigen::Matrix3d R = T_cl.block<3,3>(0,0);
     Eigen::Vector3d t = T_cl.block<3,1>(0,3);
+    // 将旋转矩阵转换为轴角表示
     Eigen::Vector3d angle_axis;
     ceres::RotationMatrixToAngleAxis(R.data(), angle_axis.data());
+    
+    // 创建全景相机模型
     Equirectangular eq(frames[0].GetImageRows(), frames[0].GetImageCols());
+    
+    // 遍历所有匹配的直线对
     for(eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>>::const_iterator it = line_pairs.begin();
                 it != line_pairs.end(); it++)
     {
@@ -46,26 +59,30 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
         for(const CameraLidarLinePair& pair : line_pair)
         {
             const cv::Vec4f& l = pair.image_line;
-            // 把起始点和终止点都变换成单位圆上的XYZ坐标
+            // 将图像直线的端点投影到单位球面上
             cv::Point3f p1 = eq.ImageToCam(cv::Point2f(l[0], l[1]), float(5.0));
             cv::Point3f p2 = eq.ImageToCam(cv::Point2f(l[2], l[3]), float(5.0));
-            // cout << p1.x * p1.x + p1.y * p1.y + p1.z * p1.z << " " << p2.x * p2.x + p2.y * p2.y + p2.z * p2.z <<endl;
             cv::Point3f p3(0,0,0);
+            
+            // 计算过这三个点的平面法向量
             double a = ( (p2.y-p1.y)*(p3.z-p1.z)-(p2.z-p1.z)*(p3.y-p1.y) );
             double b = ( (p2.z-p1.z)*(p3.x-p1.x)-(p2.x-p1.x)*(p3.z-p1.z) );
             double c = ( (p2.x-p1.x)*(p3.y-p1.y)-(p2.y-p1.y)*(p3.x-p1.x) );
 
+            // 添加平面到平面的约束
             ceres::CostFunction *cost_function = Plane2Plane_Relative::Create(Eigen::Vector3d(a,b,c), pair.lidar_line_end, pair.lidar_line_start);
             problem.AddResidualBlock(cost_function, loss_function, angle_axis.data(), t.data());
 
+            // 添加平面相对IOU的约束
             ceres::CostFunction *cost_function2 = PlaneRelativeIOUResidual::Create(
                         Eigen::Vector4d(a,b,c,0), (pair.lidar_line_start + pair.lidar_line_end) / 2.0, p1, p2, 2);
             problem.AddResidualBlock(cost_function2, nullptr, angle_axis.data(), t.data());
         }
-
     }
 
     LOG(INFO) << "total residual: " <<problem.NumResidualBlocks() << endl;
+    
+    // 配置求解器参数
     ceres::Solver::Options options;
     options.max_num_iterations = 50;
     options.max_linear_solver_iterations = 100;
@@ -74,10 +91,12 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
     options.minimizer_progress_to_stdout = true;
     options.num_threads = 10;
 
+    // 求解优化问题
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     LOG(INFO) << summary.BriefReport() << '\n';
-    // std::cout << summary.IsSolutionUsable() << std::endl;
+    
+    // 将优化后的结果转换回变换矩阵
     ceres::AngleAxisToRotationMatrix(angle_axis.data(), R.data());
     T_cl_optimized = Eigen::Matrix4d::Identity();
     T_cl_optimized.block<3,3>(0,0) = R;
@@ -86,93 +105,166 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
     return 1;
 }
 
+// 这个函数用于从图像中提取直线特征
+// 输入参数:
+// - image_line_folder: 存储图像直线特征的文件夹路径
+// - visualization: 是否需要可视化结果
 bool CameraLidarOptimizer::ExtractImageLines(string image_line_folder, bool visualization)
 {
     const size_t length = frames.size();
-    // 先从本地读取图像直线，如果失败了就重新计算
+    // 先尝试从本地文件夹读取之前提取好的图像直线特征
+    // 如果读取成功就直接返回,避免重复计算
     if(ReadPanoramaLines(image_line_folder, config.image_path, image_lines_all))
         return true;
+    
     image_lines_all.reserve(length);
     LOG(INFO) << "Extract image lines for " << length << " images";
     if(length == 0)
         return false;
+        
+    // 读取深度图像文件名列表(目前未使用)
     vector<string> depth_image_names = IterateFiles(config.depth_path, ".bin");
+    
+    // 读取掩码图像(如果有的话)
     cv::Mat img_mask;
     if(!config.mask_path.empty())
         img_mask = cv::imread(config.mask_path, CV_LOAD_IMAGE_GRAYSCALE);
+        
+    // 显示处理进度条
     ProcessBar bar(length, 0.2);
+    
+    // 使用OpenMP多线程并行处理
     omp_set_num_threads(5);
     #pragma omp parallel for schedule(dynamic)
     for(size_t i = 0; i < length; i++)
     {
+        // 获取灰度图像
         cv::Mat img_gray = frames[i].GetImageGray();
+        // 创建全景图像直线检测器
         PanoramaLine detect(img_gray, i);
         detect.SetName(frames[i].name);
-        // 用深度图来指导图像直线提取，效果并不好
-        // if(!depth_image_names.empty())
-        // {
-        //     cv::Mat depth;
-        //     ReadOpenCVMat(depth_image_names[i], depth);
-        //     depth.convertTo(depth, CV_32F);
-        //     depth /= 256.0;
-        //     detect.SetDepthImage(depth);
-        // }
+        
+        // 根据是否有掩码图像选择不同的直线检测方式
         if(!img_mask.empty())
             detect.Detect(img_mask);
         else 
-            detect.Detect(45, -45);
+            detect.Detect(45, -45);  // 检测45度到-45度范围内的直线
+            
+        // 融合相近的直线
         detect.Fuse(config.ncc_threshold);
-        // 显示提取出的直线，用于debug
+        
+        // 如果需要可视化,则绘制检测到的直线
         if(visualization)
         {
+            // 定义不同颜色用于绘制直线
             vector<cv::Scalar> colors = {cv::Scalar(0,0,255), cv::Scalar(52,134,255),   // 红 橙
                                         cv::Scalar(20,230,255), cv::Scalar(0, 255,0),   // 黄 绿
                                         cv::Scalar(255,255,51), cv::Scalar(255, 0,0),   // 蓝 蓝
                                         cv::Scalar(255,0,255)};                         // 紫
+            // 在图像上绘制直线                            
             cv::Mat img_line = DrawLinesOnImage(img_gray, detect.GetLines(), colors, 6, true);
+            // 根据优化模式选择保存路径
             if(optimization_mode == CALIBRATION)
                 cv::imwrite(config.calib_result_path + "/img_line_filtered" + num2str(frames[i].id) + ".jpg", img_line);
             else 
                 cv::imwrite(config.joint_result_path + "/img_line_filtered" + num2str(frames[i].id) + ".jpg", img_line);
         }
+        
+        // 临界区:将检测结果添加到全局变量中
         #pragma omp critical
         {
             image_lines_all.push_back(detect);
         }
         bar.Add();
     }
-    // 对图像直线进行排序
+    
+    // 对所有图像直线按ID排序
     sort(image_lines_all.begin(), image_lines_all.end(), [this](PanoramaLine& a, PanoramaLine& b){return a.id < b.id;});
-    // 保存图像直线，下次可以直接使用
+    
+    // 将提取的直线特征保存到本地,方便下次直接读取使用
     ExportPanoramaLines(image_line_folder, image_lines_all);
     return true;
 }
 
+// 这段代码实现了从激光雷达数据中提取直线特征的功能。主要步骤如下:
+
+// ExtractLidarLines函数接收一个visualization参数用于控制是否可视化结果
 bool CameraLidarOptimizer::ExtractLidarLines(bool visualization)
 {
+    // 获取激光雷达数据的数量
     const size_t length = lidars.size();
 
     LOG(INFO) << "Extract lidar lines for " << length << " lidar data";
+    
+    // 设置OpenMP并行线程数
     omp_set_num_threads(config.num_threads);
+    
+    // 使用OpenMP并行处理每一帧激光雷达数据
     #pragma omp parallel for
     for(size_t i = 0; i < length; i++)
     {
-        // 如果某一帧雷达没有特征点，那么大概率是这一帧雷达没有进行特征提取，也有可能是根本就没有读点云
-        // 无论那种情况，都是重新搞一遍，可能会慢一点，但是肯定没错误（又不需要实时性）
+        // 如果当前帧没有特征点(cornerLessSharp为空),说明需要重新进行特征提取
+        // 可能的原因:1.没有进行过特征提取 2.没有读取点云数据
         if(lidars[i].cornerLessSharp.empty())
         {
+            // 重新加载激光雷达数据
             lidars[i].LoadLidar(lidars[i].name);
+            // 重新排序VLP点云
             lidars[i].ReOrderVLP();
+            // 提取特征点,包括:
+            // - 曲率阈值(max_curvature)
+            // - 交叉角度阈值(intersection_angle_threshold)
+            // - 特征提取方法(extraction_method)
+            // - 是否进行分割(lidar_segmentation)
             lidars[i].ExtractFeatures(config.max_curvature, config.intersection_angle_threshold, 
                                     config.extraction_method, config.lidar_segmentation);
         }
+
+        // 如果需要可视化,保存特征点
         if(visualization)
             lidars[i].SaveFeatures(config.joint_result_path);
+            
+        // 如果点云在世界坐标系下,转换到局部坐标系
         if(lidars[i].IsInWorldCoordinate())
             lidars[i].Transform2Local();    
     }
     return true;
 }
+
+// 这个函数实现了相机和激光雷达的联合优化功能。主要包含两种模式:
+
+// 1. 标定模式(CALIBRATION):
+// - 用于标定相机和激光雷达之间的外参
+// - 要求相机和激光雷达数据是同步的,数量相等
+// - 迭代优化过程:
+//   a. 使用当前外参进行直线特征关联
+//   b. 优化外参
+//   c. 计算外参变化量
+//   d. 如果变化量小于阈值则结束,否则继续迭代
+// - 可选择是否可视化结果
+
+// 2. 建图模式(MAPPING):
+// - 用于多相机多激光雷达的整体位姿优化
+// - 主要步骤:
+//   a. 保存初始的相机和激光雷达位姿用于可视化
+//   b. 读取或重新计算图像特征点的三维结构
+//   c. 迭代优化:
+//     - 进行直线特征关联
+//     - 优化位姿和结构
+//     - 保存中间结果
+//     - 检查收敛条件(cost变化<1%或连续两次迭代步数<5)
+//   d. 可选择是否可视化最终结果
+
+// 函数开始时会输出当前使用的配置信息,包括:
+// - 是否使用角度残差
+// - 是否使用点到线残差
+// - 是否使用线到线残差
+// - 是否使用点到面残差
+// - 激光雷达平面容差
+// - 是否归一化距离
+// - 相机-相机权重
+// - 激光雷达-激光雷达权重
+// - 相机-激光雷达权重
 
 bool CameraLidarOptimizer::JointOptimize(bool visualization)
 {
@@ -298,26 +390,37 @@ bool CameraLidarOptimizer::JointOptimize(bool visualization)
 }
 
 // {image id, lidar id} => {line pair}
+// 这个函数用于将相机图像中的直线和激光雷达点云中的直线进行关联匹配
+// 输入参数T_cl是相机到激光雷达的变换矩阵
+// 返回值是一个map,键是pair<图像id,激光雷达id>,值是对应的直线匹配对
 eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> CameraLidarOptimizer::AssociateLineSingle(Eigen::Matrix4d T_cl)
 {
+    // 设置OpenMP的线程数
     omp_set_num_threads(config.num_threads);
+    // 用于存储所有的直线匹配对
     eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> line_pairs_all;
+    // 并行处理每一帧图像
     #pragma omp parallel for schedule(dynamic)
     for(size_t i = 0; i < frames.size(); i++)
     {
+        // 创建直线匹配器对象,传入图像的尺寸和灰度图
         CameraLidarLineAssociate associate(frames[i].GetImageRows(), frames[i].GetImageCols(), frames[i].GetImageGray());
+        // 如果激光雷达已经进行了边缘分割
         if(!lidars[i].edge_segmented.empty())
+            // 使用角度信息进行直线匹配
             associate.AssociateByAngle(image_lines_all[i].GetLines(), lidars[i].edge_segmented, lidars[i].segment_coeffs, 
                                 lidars[i].cornerLessSharp, lidars[i].point_to_segment, lidars[i].end_points, T_cl);
-            // associate.Associate(image_lines_all[i], lidars[i].edge_segmented, T_cl);
         else 
+            // 否则直接进行直线匹配
             associate.Associate(image_lines_all[i].GetLines(), lidars[i].cornerLessSharp, T_cl);
+        // 临界区,将匹配结果存入map
         #pragma omp critical 
         {
             line_pairs_all[pair<size_t, size_t>(i,i)] = associate.GetAssociatedPairs();;
         }
     }
     
+    // 统计匹配的直线对数量
     size_t num_line_pairs = 0;
     for(eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>>::const_iterator it = line_pairs_all.begin();
         it != line_pairs_all.end(); it++)
@@ -328,26 +431,42 @@ eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> CameraLid
 }
 
 // {image id, lidar id} => {line pair}
+// 这个函数用于在多帧图像和激光雷达数据之间进行直线特征的关联匹配
+// 输入参数:
+// - neighbor_size: 每帧图像需要匹配的相邻激光雷达帧数
+// - temporal: 是否考虑时序关系进行匹配
+// - use_lidar_track: 是否使用激光雷达的跟踪信息
+// - use_image_track: 是否使用图像的跟踪信息
+// 返回值是一个map,键是pair<图像id,激光雷达id>,值是对应的直线匹配对
 eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> CameraLidarOptimizer::AssociateLineMulti(
         const int neighbor_size, const bool temporal, const bool use_lidar_track, const bool use_image_track)
 {
+    // 设置OpenMP的线程数
     omp_set_num_threads(config.num_threads);
     LOG(INFO) << "Associate lines, neighbor size = " << neighbor_size;
-    // 为每个frame找到用于匹配的近邻的LiDAR
+    
+    // 为每个图像帧找到用于匹配的相邻激光雷达帧
     vector<vector<int>> each_frame_neighbor = NeighborEachFrame(neighbor_size, temporal);
+    
+    // 如果使用跟踪信息,创建掩码数组
     vector<vector<bool>> image_mask_all(frames.size()), lidar_mask_all(lidars.size());
     if(use_lidar_track)
         lidar_mask_all = LidarMaskByTrack();
     if(use_image_track)
         image_mask_all = ImageMaskByTrack();
+        
+    // 用于存储所有的直线匹配对
     eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> line_pairs_all;
     
+    // 并行处理每一帧图像
     #pragma omp parallel for schedule(dynamic)
     for(size_t frame_id = 0; frame_id < frames.size(); frame_id++)
     {
+        // 遍历当前图像帧的所有相邻激光雷达帧
         for(const int& lidar_id : each_frame_neighbor[frame_id])
         {
             const Velodyne& lidar = lidars[lidar_id];
+            // 计算相机到激光雷达的变换矩阵
             Eigen::Matrix4d T_cl = T_cl_init;
             if(frames[frame_id].IsPoseValid() && lidar.IsPoseValid())
             {
@@ -355,34 +474,52 @@ eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> CameraLid
                 Eigen::Matrix4d T_wl = lidar.GetPose();
                 T_cl = T_wc.inverse() * T_wl;
             }
+            
+            // 创建直线匹配器对象
             CameraLidarLineAssociate associate(frames[frame_id].GetImageRows(), frames[frame_id].GetImageCols());
-            // 判断LiDAR是否已经进行过直线拟合了，如果是的话就以此为先验信息，得到更准确的匹配效果
+            
+            // 根据激光雷达是否已经进行直线拟合选择不同的匹配方式
             if(!lidar.edge_segmented.empty())
-                // associate.Associate(image_lines_all[frame_id], lidar.edge_segmented, T_cl);
+                // 使用角度信息进行直线匹配
                 associate.AssociateByAngle(image_lines_all[frame_id].GetLines(), lidar.edge_segmented, lidar.segment_coeffs,
                              lidar.cornerLessSharp, lidar.point_to_segment, lidar.end_points, T_cl, true, 
                              image_mask_all[frame_id], lidar_mask_all[lidar_id]);
-                            
             else 
+                // 直接进行直线匹配
                 associate.Associate(image_lines_all[frame_id].GetLines(), lidar.cornerLessSharp, T_cl);
+                
+            // 获取匹配结果
             vector<CameraLidarLinePair> pairs = associate.GetAssociatedPairs();
-            // 设置直线权重
-            // SetLineWeight(pairs, frame_id, lidar_id_start);
+            
+            // 临界区,将匹配结果存入map
             #pragma omp critical
             {
                 line_pairs_all[pair<size_t,size_t>(frame_id, lidar_id)] = pairs;
             }
-        
         }
     }
+    
+    // 统计匹配的直线对数量
     size_t num_line_pairs = 0;
     for(eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>>::const_iterator it = line_pairs_all.begin();
         it != line_pairs_all.end(); it++)
         num_line_pairs += it->second.size();
     LOG(INFO) << "Associate " << num_line_pairs << " line pairs";
+    
     return line_pairs_all;
 }
 
+
+// 这个函数实现了相机和激光雷达的联合优化。主要功能包括:
+
+// 输入参数:
+// - line_pairs: 相机和激光雷达之间匹配的直线对
+// - structure: 三角化得到的3D点云结构
+// - refine_camera_rotation/trans: 是否优化相机的旋转/平移
+// - refine_lidar_rotation/trans: 是否优化激光雷达的旋转/平移  
+// - refine_structure: 是否优化3D点云结构
+// - cost: 输出优化后的代价值
+// - steps: 输出优化迭代步数
 
 int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>>& line_pairs, 
                 std::vector<PointTrack>& structure, const bool refine_camera_rotation,
@@ -390,13 +527,13 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
                 const bool refine_lidar_trans, const bool refine_structure,
                 double& cost, int& steps)
 {
-    // 1. 取出所有的相机位姿和雷达位姿并单独保存下来进行优化，防止影响到原本的位姿
-    // 而且取出了雷达的中心用于之后的lidar-lidar约束
+    // 1. 取出所有相机和激光雷达的位姿,转换为轴角表示进行优化
     eigen_vector<Eigen::Vector3d> angleAxis_cw_list(frames.size()), angleAxis_lw_list(lidars.size());
     eigen_vector<Eigen::Vector3d> t_cw_list(frames.size()), t_lw_list(lidars.size());
     pcl::PointCloud<pcl::PointXYZI> lidar_center;
-    for(size_t i = 0; i < frames.size(); i++)
-    {
+    
+    // 提取相机位姿
+    for(size_t i = 0; i < frames.size(); i++) {
         if(!frames[i].IsPoseValid())
             continue;
         Eigen::Matrix4d T_cw = frames[i].GetPose().inverse();
@@ -404,8 +541,9 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
         ceres::RotationMatrixToAngleAxis(R_cw.data(), angleAxis_cw_list[i].data());
         t_cw_list[i] = T_cw.block<3,1>(0,3);
     }
-    for(size_t i = 0; i < lidars.size(); i++)
-    {
+    
+    // 提取激光雷达位姿
+    for(size_t i = 0; i < lidars.size(); i++) {
         if(!lidars[i].IsPoseValid() || !lidars[i].valid)
             continue;
         Eigen::Matrix4d T_wl = lidars[i].GetPose();
@@ -416,41 +554,35 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
         lidars[i].Transform2LidarWorld();
     }
     
+    // 2. 构建优化问题
     ceres::Problem problem;
-    ceres::LossFunction*  loss_function1 = new ceres::HuberLoss(3 * M_PI / 180.0);     // 夹角为2度
-    // ceres::LossFunction *  loss_function = new ceres::HuberLoss(1);         // 点到直线距离为1米
-
-    LOG(INFO) << "Add residuals to problem";
-    // 2. 遍历所有的直线匹配关系，进行lidar-camera之间的匹配
+    ceres::LossFunction* loss_function1 = new ceres::HuberLoss(3 * M_PI / 180.0);  // 夹角阈值为3度
+    
+    // 3. 添加各类约束
+    // 添加相机-激光雷达之间的约束
     size_t residual_camera_lidar = AddCameraLidarResidual(frames, lidars,
                     angleAxis_cw_list, t_cw_list, angleAxis_lw_list, t_lw_list, 
                     line_pairs, loss_function1, problem, config.camera_lidar_weight);
     LOG(INFO) << "num residual blocks for camera-lidar : " << residual_camera_lidar;
 
-    // 3. 根据三角化的点进行重投影误差的约束，这是camera-camera的约束
+    // 添加相机-相机之间的重投影约束
     size_t residual_camera = AddCameraResidual(frames, angleAxis_cw_list, t_cw_list, structure, 
                         problem, RESIDUAL_TYPE::ANGLE_RESIDUAL_1, config.camera_weight);
     LOG(INFO) << "num residual blocks for camera-camera: " << residual_camera;
 
-    // 4.根据雷达之间的匹配关系进行约束，这是lidar-lidar的约束
+    // 添加激光雷达-激光雷达之间的约束
     vector<vector<int>> neighbors = FindNeighbors(lidars, 6);
     size_t residual_lidar = 0;
     if(config.point_to_line_residual)
         residual_lidar += AddLidarPointToLineResidual(neighbors, lidars, angleAxis_lw_list, t_lw_list, problem, 
                                 config.point_to_line_dis_threshold, config.angle_residual, config.normalize_distance, config.lidar_weight);
-    if(config.line_to_line_residual)
-    {
-    #if 0 
-        residual_lidar += AddLidarLineToLineResidual(neighbors, lidars, angleAxis_lw_list, t_lw_list, problem, 
-                                config.point_to_line_dis_threshold, config.angle_residual, config.normalize_distance, config.lidar_weight);
-    #endif
+    if(config.line_to_line_residual) {
         LidarLineMatch matcher(lidars);
         matcher.SetNeighborSize(4);
         matcher.SetMinTrackLength(3);
         matcher.GenerateTracks();
         residual_lidar += AddLidarLineToLineResidual2(neighbors, lidars, angleAxis_lw_list, t_lw_list, problem, matcher.GetTracks(),
                                     config.point_to_line_dis_threshold, config.angle_residual, config.normalize_distance);
-
     }
     if(config.point_to_plane_residual)
         residual_lidar += AddLidarPointToPlaneResidual(neighbors, lidars, angleAxis_lw_list, t_lw_list, problem, 
@@ -458,28 +590,26 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
                                 config.normalize_distance, config.lidar_weight);
     LOG(INFO) << "num residual blocks for lidar-lidar: " << residual_lidar;
 
-    // 固定三维空间点位置
-    if(refine_structure == false)
-    {
+    // 4. 根据参数设置固定部分变量
+    // 固定3D点云结构
+    if(refine_structure == false) {
         for(const PointTrack& track : structure)
             problem.SetParameterBlockConstant(track.point_3d.data());
     }
+    
     // 固定相机位姿
-    for(size_t i = 0 ; i < frames.size(); i++)
-    {
-        if(frames[i].IsPoseValid())
-        {
+    for(size_t i = 0 ; i < frames.size(); i++) {
+        if(frames[i].IsPoseValid()) {
             if(refine_camera_rotation == false)
                 problem.SetParameterBlockConstant(angleAxis_cw_list[i].data());
             if(refine_camera_trans == false)
                 problem.SetParameterBlockConstant(t_cw_list[i].data());
         }
     }
-    // 固定LiDAR位姿
-    for(size_t i = 0 ; i < lidars.size(); i++)
-    {
-        if(lidars[i].IsPoseValid() && lidars[i].valid)
-        {
+    
+    // 固定激光雷达位姿
+    for(size_t i = 0 ; i < lidars.size(); i++) {
+        if(lidars[i].IsPoseValid() && lidars[i].valid) {
             if(refine_lidar_rotation == false)
                 problem.SetParameterBlockConstant(angleAxis_lw_list[i].data());
             if(refine_lidar_trans == false)
@@ -487,18 +617,20 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
         }
     }    
 
+    // 固定第一帧相机位姿作为参考坐标系
     problem.SetParameterBlockConstant(angleAxis_cw_list[0].data());
     problem.SetParameterBlockConstant(t_cw_list[0].data());
-    // problem.SetParameterBlockConstant(angleAxis_lw_list[0].data());
-    // problem.SetParameterBlockConstant(t_lw_list[0].data());
 
+    // 5. 求解优化问题
     LOG(INFO) << "total residual blocks : " << problem.NumResidualBlocks();
     ceres::Solver::Options options = SetOptionsSfM(config.num_threads);
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
-    if(!summary.IsSolutionUsable())
-    {
+    
+    // 6. 检查优化结果
+    if(!summary.IsSolutionUsable()) {
         LOG(INFO) << summary.FullReport();
+        // 保存失败时的位姿用于调试
         ofstream f(config.joint_result_path + "/camera_pose_fail.txt");
         for(size_t i = 0; i < angleAxis_cw_list.size(); i++)
             f << angleAxis_cw_list[i].x() << " " << angleAxis_cw_list[i].y() << " " << angleAxis_cw_list[i].z() << " " 
@@ -512,9 +644,11 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
         LOG(ERROR) << "Camera LiDAR optimization failed";
         return false;
     }
+    
+    // 7. 更新优化后的位姿
     LOG(INFO) << summary.BriefReport();
-    for(size_t i = 0; i < frames.size(); i++)
-    {
+    // 更新相机位姿
+    for(size_t i = 0; i < frames.size(); i++) {
         if(!frames[i].IsPoseValid())
             continue;
         Eigen::Matrix3d R_cw;
@@ -526,12 +660,12 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
         frames[i].SetPose(T_cw.inverse());
     }
 
+    // 更新激光雷达位姿
     #pragma omp parallel for 
-    for(size_t i = 0; i < lidars.size(); i++)
-    {
+    for(size_t i = 0; i < lidars.size(); i++) {
         if(!lidars[i].IsPoseValid())
             continue;
-        // 如果雷达在世界坐标系下，那么就一定要先变换到局部坐标系，然后再更新位姿
+        // 如果雷达在世界坐标系下，需要先转换到局部坐标系再更新位姿
         if(lidars[i].IsInWorldCoordinate())
             lidars[i].Transform2Local();
         Eigen::Matrix3d R_lw;
@@ -542,6 +676,8 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
         T_lw.block<3,1>(0,3) = t_lw;
         lidars[i].SetPose(T_lw.inverse());
     }
+    
+    // 8. 返回优化结果
     cost = summary.final_cost;
     steps = summary.num_successful_steps;
     return 1;
