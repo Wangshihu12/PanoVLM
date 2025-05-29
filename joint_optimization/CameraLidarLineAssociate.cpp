@@ -19,37 +19,57 @@ const vector<CameraLidarLinePair> CameraLidarLineAssociate::GetAssociatedPairs()
 {
     return line_pairs;
 }
+
+/**
+ * [功能描述]：将图像中的直线特征与激光雷达点云中的点进行关联匹配
+ * 该函数基于距离匹配方式，将激光雷达点投影到图像平面，再寻找最近的图像直线
+ * @param [lines]：图像中检测到的直线特征数组，每个直线用起点和终点表示(x1,y1,x2,y2)
+ * @param [point_cloud]：激光雷达点云数据
+ * @param [T_cl]：相机到激光雷达的变换矩阵，用于将激光雷达点云变换到相机坐标系
+ */
 void CameraLidarLineAssociate::Associate(const std::vector<cv::Vec4f>& lines, const pcl::PointCloud<pcl::PointXYZI> point_cloud, 
                             const Eigen::Matrix4d T_cl)
 {
+    // 将激光雷达点云从激光雷达坐标系变换到相机坐标系
     pcl::PointCloud<pcl::PointXYZI> cloud;
     pcl::transformPointCloud(point_cloud, cloud, T_cl);
+
+    // 创建全景图投影器(赤道平面投影)
     Equirectangular eq(rows, cols);
-    // 一条直线在球型投影下会成为一个曲线，在LiDAR和直线相关联的时候，曲线不好操作，因此把一个长直线变成一个个的短直线
-    // 用短直线来近似长直线在球型投影下得到的曲线
+    // 在全景图像中，一条直线会投影成曲线，因此将长直线分解为多个短直线
+    // 用短直线来近似长直线在球面投影下的曲线
     vector<cv::Point2f> sub_lines;
     size_t sub_line_count = 0;
-    // 记录每个小直线所属于的原本的直线的index
+    // 记录每个小直线片段所属的原始直线索引
     map<size_t, size_t> subline_to_line;
 
+    // 遍历所有图像直线，将每条直线分解为多个小段
     for(size_t line_idx = 0; line_idx < lines.size(); line_idx++)
     {
-        // 由于一条直线在全景图像上是曲线，首先把这条直线分成一段段的小直线来近似
+        // 将直线分解为多个小段，每段约70像素长度
         vector<cv::Point2f> segments = eq.BreakToSegments(lines[line_idx], 70);
-        // 把每一小段直线都用这段直线的中点表示
+        // 用每小段直线的中点表示该段直线
         for(size_t i = 0; i < segments.size() - 1; i++)
         {
+            // 如果相邻两点跨越了图像边界(在全景图中表现为x坐标相差很大)，则跳过
             if(abs(segments[i].x - segments[i+1].x) > 0.8 * cols)       
                 continue;
+
+            // 计算短线段的中点坐标
             cv::Point2f center;
             center.x = (segments[i+1].x + segments[i].x) / 2.0; 
             center.y = (segments[i+1].y + segments[i].y) / 2.0; 
+
+            // 将中点添加到子直线列表中
             sub_lines.push_back(center);
+
+            // 记录该子直线对应的原始直线索引
             subline_to_line[sub_line_count] = line_idx;
             sub_line_count++;
         }
     }
 
+    // 创建包含所有短线段中点的矩阵，用于构建KD树
     cv::Mat points(sub_line_count, 2, CV_32F);
     for(int i = 0; i < sub_line_count; i++)
     {
@@ -57,44 +77,59 @@ void CameraLidarLineAssociate::Associate(const std::vector<cv::Vec4f>& lines, co
         points.at<float>(i, 1) = sub_lines[i].y;
     }
 
-    // 建立一棵kd树，衡量距离默认使用L2距离
+    // 建立KD树用于快速查找最近的短线段
     cv::flann::Index kdtree(points, cv::flann::KDTreeIndexParams(1)); //此部分建立kd-tree索引同上例，故不做详细叙述
 
-    unsigned queryNum = 3;//用于设置返回邻近点的个数
-    vector<float> curr_point(2);//存放 查询点 的容器（本例都是vector类型）
-    vector<int> vecIndex(queryNum);//存放返回的点索引
-    vector<float> vecDist(queryNum);//存放距离
-    cv::flann::SearchParams params(32);//设置knnSearch搜索参数
-    // 保存雷达点和图像直线之间的对应关系，由于位姿可能不准确，所以这种对应关系不是唯一的，也就是说，一个雷达点可以对应多个
-    // 图像直线，
-    std::map<int, vector<size_t> > lidar_line;      // lidar点对应的直线的index      lidar -> line
-    std::map<int, vector<size_t> > line_lidar;      // 直线对应的lidar点   line -> lidar
+    // 设置查询参数
+    unsigned queryNum = 3; // 每次查询返回3个最近的邻居
+    vector<float> curr_point(2); // 存放查询点的容器
+    vector<int> vecIndex(queryNum); // 存放返回的点索引
+    vector<float> vecDist(queryNum); // 存放查询点到返回点的距离
+    cv::flann::SearchParams params(32); // 设置查询参数
 
+    // 保存激光雷达点和图像直线之间的对应关系
+    // 由于位姿可能不准确，一个激光雷达点可能对应多条图像直线，反之亦然
+    std::map<int, vector<size_t> > lidar_line;      // 激光雷达点索引 -> 直线索引数组
+    std::map<int, vector<size_t> > line_lidar;      // 直线索引 -> 激光雷达点索引数组
+
+    // 遍历激光雷达点云中的每个点
     for(size_t lidar_idx = 0; lidar_idx < cloud.size(); lidar_idx++)
     {
+        // 将激光雷达点从3D空间投影到图像平面
         cv::Point3f point(cloud.points[lidar_idx].x, cloud.points[lidar_idx].y, cloud.points[lidar_idx].z);
         cv::Point2f pixel = eq.CamToImage(point);
+
+        // 在KD树中查找最近的短线段
         curr_point = {pixel.x, pixel.y};
         kdtree.knnSearch(curr_point, vecIndex, vecDist, queryNum, cv::flann::SearchParams(-1));   
+
+        // 遍历查询结果，建立点与直线的对应关系
         for(size_t i = 0; i < vecIndex.size(); i++)
         {
+            // 如果距离超过阈值(60像素的平方)，则认为不匹配
             if(vecDist[i] > 60 * 60)
                 continue;
+
+            // 记录激光雷达点对应的原始直线索引
             lidar_line[lidar_idx].push_back(subline_to_line[vecIndex[i]]);
+            // 记录直线对应的激光雷达点索引
             line_lidar[subline_to_line[vecIndex[i]]].push_back(lidar_idx);
         }
     }
 
-    // 遍历每一根直线以及其近邻的雷达投影点
+    // 遍历每条直线及其对应的激光雷达点，进行直线拟合
     for(map<int, vector<size_t>>::iterator it = line_lidar.begin(); it != line_lidar.end(); it++)
     {
+        // 收集当前直线对应的所有激光雷达点
         pcl::PointCloud<pcl::PointXYZI> line_points;
-        // 如果直线对应的雷达点少于10个，就跳过
+        // 如果直线对应的激光雷达点少于6个，则认为匹配不可靠，跳过
         if(it->second.size() < 6)
         {
             it->second.clear();
             continue;
         }
+
+        // 将所有对应的激光雷达点加入点云
         for(size_t lidar_idx : it->second)
         {    
             line_points.push_back(cloud.points[lidar_idx]);
@@ -106,16 +141,17 @@ void CameraLidarLineAssociate::Associate(const std::vector<cv::Vec4f>& lines, co
         // DrawLine(img_line_cloud, lines[it->first], cv::Scalar(0, 0, 255), 3, 2);
         // cv::imwrite("line_and_points_" + num2str(it->first) + ".jpg", img_line_cloud);
 
-        // 用占比最大的segment里的点拟合一个直线
+        // 使用RANSAC方法从点云中拟合一条3D直线
         pcl::ModelCoefficients line_coeff;
         vector<size_t> inliers;
         if(!FitLineRANSAC(line_points, line_coeff, inliers))
         {
+            // 如果直线拟合失败，清除该直线的匹配点并跳过
             it->second.clear();
             continue;
         }
         
-        // 找到所有的内点中距离最远的两个点
+        // 在所有内点中找到距离最远的两个点作为直线的端点
         size_t start = 0, end = 0;
         float max_distance = -1;
         for(size_t i = 0; i < inliers.size(); i++)
@@ -132,22 +168,26 @@ void CameraLidarLineAssociate::Associate(const std::vector<cv::Vec4f>& lines, co
             }
         }
         
-        // 把相距最远的两个内点投影到直线上
+        // 将距离最远的两个内点投影到拟合的直线上，作为直线的精确端点
         Eigen::Vector3d p1 = ProjectPoint2Line3D(PclPonit2EigenVecd(line_points[start]), line_coeff);
         Eigen::Vector3d p2 = ProjectPoint2Line3D(PclPonit2EigenVecd(line_points[end]), line_coeff);
         
+        // 创建相机-激光雷达直线对，并添加到结果列表
         CameraLidarLinePair line_pair;
         line_pair.image_line = lines[it->first];
-        line_pair.lidar_line_start = p1;    // 注意这些点都是在相机坐标系下的
+        line_pair.lidar_line_start = p1;    // 注意：这些点都是在相机坐标系下的
         line_pair.lidar_line_end = p2;
-        line_pair.angle = FLT_MAX;
+        line_pair.angle = FLT_MAX; // 初始角度设为最大值
         line_pairs.push_back(line_pair);
 
-        // 之后的都是可视化处理，只在debug使用
+        // 以下是可视化代码，用于调试时显示匹配结果
         continue;
+
+        // 将激光雷达直线的端点投影回图像平面
         Eigen::Vector2d p1_pixel = eq.SphereToImage(eq.CamToSphere(p1));
         Eigen::Vector2d p2_pixel = eq.SphereToImage(eq.CamToSphere(p2));
 
+        // 将原始图像直线和投影后的激光雷达直线一起显示
         vector<cv::Vec4f> tmp_lines = {lines[it->first], cv::Vec4f(p1_pixel.x(), p1_pixel.y(), p2_pixel.x(), p2_pixel.y())};
         vector<cv::Scalar> colors = {cv::Scalar(0,0,255), cv::Scalar(52,134,255),   // 红 橙
                                 cv::Scalar(20,230,255), cv::Scalar(0, 255,0),   // 黄 绿
@@ -155,6 +195,7 @@ void CameraLidarLineAssociate::Associate(const std::vector<cv::Vec4f>& lines, co
                                 cv::Scalar(255,0,255)}; 
         cv::Mat img_line = DrawLinesOnImage(img_gray, tmp_lines, colors, 4, true);
         
+        // 在图像上标记出激光雷达点
         pcl::PointCloud<pcl::PointXYZI> tmp_cloud;
         tmp_cloud.push_back(line_points[start]);
         tmp_cloud.push_back(line_points[end]);
@@ -169,6 +210,7 @@ void CameraLidarLineAssociate::Associate(const std::vector<cv::Vec4f>& lines, co
     //     cv::imwrite("lidar_line_all.jpg", img_lidar_line);
     // }
     
+    // 对匹配结果进行过滤，去除不合理的匹配
     Filter(true, true);
     
     // 把经过过滤的直线画在图像上，用于debug
@@ -178,10 +220,11 @@ void CameraLidarLineAssociate::Associate(const std::vector<cv::Vec4f>& lines, co
     //     cv::imwrite("lidar_line_all_filtered.jpg", img_lidar_line);
     // }
 
-    // 把匹配的直线重新变回LiDAR坐标系下
+    // 将匹配的直线对从相机坐标系转换回激光雷达坐标系
     Eigen::Matrix4d T_lc = T_cl.inverse();
     for(CameraLidarLinePair& lp : line_pairs)
     {
+        // 转换激光雷达直线的端点坐标
         lp.lidar_line_start = (T_lc * lp.lidar_line_start.homogeneous()).hnormalized();
         lp.lidar_line_end = (T_lc * lp.lidar_line_end.homogeneous()).hnormalized();
     }
@@ -622,71 +665,112 @@ Eigen::Matrix4d CameraLidarLineAssociate::AssociateRandomDisturbance(const std::
 }
 
 
-// 对相关联的直线进行过滤，过滤的方法是两个
-// 1. 计算两个直线的夹角，夹角太大的过滤掉
-// 2. 把每个直线都分为一个个的小段，用于统计在图像上的长度，如果长度太短也直接过滤掉
+/**
+ * [功能描述]：过滤不合理的相机-激光雷达直线匹配对
+ * 主要基于角度和长度两种过滤条件筛选出高质量的匹配对
+ * @param [filter_by_angle]：是否基于角度进行过滤
+ * @param [filter_by_length]：是否基于长度进行过滤
+ */
 void CameraLidarLineAssociate::Filter(bool filter_by_angle, bool filter_by_length)
 {
-    float min_length_threshold = 100;
-    float max_length_threshold = 2000;
+    // 设置激光雷达直线投影长度的阈值范围
+    float min_length_threshold = 100; // 最小长度阈值(像素)
+    float max_length_threshold = 2000; // 最大长度阈值(像素)
+
+    // 用于存储过滤后的高质量匹配对
     vector<CameraLidarLinePair> good_pair;
+
+    // 创建全景图投影器(赤道平面投影)
     Equirectangular eq(rows, cols);
+
+    // 遍历所有匹配对，进行过滤
     for(CameraLidarLinePair& p : line_pairs)
     {
+        // 基于角度的过滤
         if(filter_by_angle)
         {
-            // 雷达直线投影到球面后得到的弧与球心形成一个平面，计算这个平面的法向量
+            // 第一步：计算激光雷达直线与球心形成的平面
+            // 激光雷达直线投影到球面后得到一条弧，这条弧与球心形成一个平面
             Eigen::Vector3d p1 = p.lidar_line_start;
             Eigen::Vector3d p2 = p.lidar_line_end;
+            // 计算平面方程参数(ax+by+cz+d=0)，其中前三个参数(a,b,c)即为平面法向量
             Eigen::Vector4d plane_lidar = FormPlane(p1, p2, Eigen::Vector3d(0,0,0));
-            plane_lidar.normalize();
+            plane_lidar.normalize(); // 归一化法向量
             
-            // 图像直线投影到球面后和球心形成一个平面，计算这个平面的法向量
+            // 第二步：计算图像直线与球心形成的平面
+            // 图像直线投影到球面也形成一条弧，同样与球心形成一个平面
             p1 = eq.ImageToCam(Eigen::Vector2d(p.image_line[0], p.image_line[1]));
             p2 = eq.ImageToCam(Eigen::Vector2d(p.image_line[2], p.image_line[3]));
             Eigen::Vector4d plane_img = FormPlane(p1, p2, Eigen::Vector3d(0,0,0));
-            plane_img.normalize();
-            // 计算两个平面的夹角，如果太大就过滤掉
+            plane_img.normalize(); // 归一化法向量
+            
+            // 第二步：计算图像直线与球心形成的平面
+            // 图像直线投影到球面也形成一条弧，同样与球心形成一个平面
             double plane_angle = PlaneAngle(plane_lidar.data(), plane_img.data(), true) * 180.0 / M_PI;
-            if(plane_angle > 5)
+            if(plane_angle > 5) // 如果夹角大于5度，则认为不匹配
                 continue;
+
+            // 记录匹配对的平面夹角
             p.angle = plane_angle;
-            // 要求雷达直线要基本在图像直线内，也就是雷达的投影不能超过图像直线范围
+            
+            // 第四步：要求激光雷达直线的投影基本在图像直线的范围内
+            // 计算图像直线的角度范围(以球心为中心的角度)
             double image_line_angle = VectorAngle3D(p1.data(), p2.data()) / 2.0;
+
+            // 将激光雷达直线的端点投影到图像直线所在平面
             Eigen::Vector3d lidar_start_projected;
             ProjectPointToPlane(p.lidar_line_start.data(), plane_img.data(), lidar_start_projected.data(), true);
             Eigen::Vector3d lidar_end_projected;
             ProjectPointToPlane(p.lidar_line_end.data(), plane_img.data(), lidar_end_projected.data(), true);
+
+            // 计算图像直线的中点
             Eigen::Vector3d image_middle = (p1 + p2) / 2.0;
+
+            // 如果激光雷达直线的起点或终点投影与图像直线中点的角度超过图像直线的角度范围，则过滤掉
             if(VectorAngle3D(lidar_start_projected.data(), image_middle.data()) > image_line_angle)
                 continue;
             if(VectorAngle3D(lidar_end_projected.data(), image_middle.data()) > image_line_angle)
                 continue;
-            // 如果雷达点到平面距离太大，过滤掉
+            
+            // 第五步：检查激光雷达点到图像平面的距离
+            // 将激光雷达点归一化并缩放到固定距离(5米)
             Eigen::Vector3d p1_cam = p.lidar_line_start.normalized() * 5;
             Eigen::Vector3d p2_cam = p.lidar_line_end.normalized() * 5;
+
+            // 计算激光雷达直线端点到图像平面的最小距离
             float distance = min(PointToPlaneDistance(plane_img.data(), p1_cam.data(),true), 
                                 PointToPlaneDistance(plane_img.data(), p2_cam.data(),true));
+
+            // 如果距离太大(>0.4米)，则过滤掉
             if(distance > 0.4)
                 continue;
         }
         
+        // 基于长度的过滤
         if(filter_by_length)
         {
-            // 把雷达直线都分成一段一段的
+            // 第一步：将激光雷达直线投影到图像平面
             cv::Point2f p1_pixel = eq.CamToImage(cv::Point3f(p.lidar_line_start.x(), p.lidar_line_start.y(), p.lidar_line_start.z()));
             cv::Point2f p2_pixel = eq.CamToImage(cv::Point3f(p.lidar_line_end.x(), p.lidar_line_end.y(), p.lidar_line_end.z()));
 
+            // 第二步：将投影后的直线分成多个小段(每段最大长度为100像素)
+            // 在全景图像中，直线会变成曲线，需要分段近似
             vector<cv::Point2f> lidar_line_seg = eq.BreakToSegments(p1_pixel, p2_pixel, 100);
     
+            // 第三步：计算激光雷达直线投影在图像上的总长度
             float lidar_line_length = 0;    // 雷达投影直线的总长度
             for(size_t i = 0; i < lidar_line_seg.size() - 1; i++)
             {
+                // 跳过跨越图像边界的段(在全景图中x坐标相差很大)
                 if(abs(lidar_line_seg[i].x - lidar_line_seg[i+1].x) > 0.8 * cols)       
                     continue;
+
+                // 累加每段的长度
                 lidar_line_length += sqrt(PointDistanceSquare(lidar_line_seg[i], lidar_line_seg[i+1]));
             }
-            // 如果雷达在图像上投影的线太短，过滤掉
+            
+            // 第四步：过滤掉投影长度不在合理范围内的匹配对
+            // 如果激光雷达直线投影太短(<100像素)或太长(>2000像素)，则过滤掉
             if(lidar_line_length < min_length_threshold)
                 continue;
             if(lidar_line_length > max_length_threshold)
@@ -707,8 +791,12 @@ void CameraLidarLineAssociate::Filter(bool filter_by_angle, bool filter_by_lengt
                 continue;
             */
         }
+
+        // 通过所有过滤条件的匹配对被视为有效匹配，加入到结果中
         good_pair.push_back(p);
     }
+
+    // 用过滤后的匹配对替换原始匹配对列表
     line_pairs.clear();
     good_pair.swap(line_pairs);
 

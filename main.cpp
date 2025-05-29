@@ -451,71 +451,106 @@ int InitLidarPose(const Config& config, map<string, double>& time_spent)
     return 0;
 }
 
+/**
+ * [功能描述]: 执行相机和激光雷达的联合优化，包括加载数据、特征提取、优化以及结果保存
+ * @param [config]: 配置参数，包含各种路径设置和算法参数
+ * @param [time_spent]: 用于记录各步骤耗时的map
+ * @return: 返回执行状态，0表示成功
+ */
 int JointOptimization(const Config& config, map<string, double>& time_spent)
 {
-    // 两个计时器
+    // 创建两个高精度计时器用于记录程序各部分执行时间
     auto t1 = chrono::high_resolution_clock::now();
     auto t2 = chrono::high_resolution_clock::now();
 
+    // 检查联合优化结果保存路径是否存在，不存在则创建
     if(!boost::filesystem::exists(config.joint_result_path))
         boost::filesystem::create_directories(config.joint_result_path);
 
+    // 获取图像目录下所有jpg格式的图像文件名
     vector<string> image_names_sync = IterateFiles(config.image_path, ".jpg");   
 
-    // 这里读取的雷达和图像一定要是所有的雷达，不能只是有位姿的雷达,可以选择用相机的位姿来设置雷达位姿，也可以选择用
-    // 雷达位姿设置相机位姿，主要看是相信哪个位姿了。方法都是一样的
+    // 加载所有相机帧数据
+    // 注意:这里读取的雷达和图像必须是所有数据，而不仅仅是有位姿的数据
+    // 可以选择用相机位姿设置雷达位姿，也可以用雷达位姿设置相机位姿，取决于哪个位姿更可靠
     vector<Frame> frames;
+    // 从指定路径读取相机帧数据，并加载图像，使用多线程加速读取
     ReadFrames(config.frame_path, config.image_path, frames, config.num_threads, true);
+
+    // 加载所有激光雷达数据
     vector<Velodyne> lidars;
-    // 先尝试读取畸变矫正的雷达，如果不成功就读取原始的雷达
+    // 首先尝试读取经过畸变矫正和优化的雷达位姿，如果失败则读取原始优化的位姿
     if(!LoadLidarPose(lidars, config.odo_result_path + "/lidar_pose_undis_refined.txt", true))
         LoadLidarPose(lidars, config.odo_result_path + "/lidar_pose_refined.txt", true);
 
-    // 用雷达位姿设置相机位姿
+    // 用雷达位姿设置相机位姿(当前代码使用此选项)
     if(true)
     {
+        // 根据雷达位姿、相机-雷达外参、时间偏移和数据间隔设置相机位姿
+        // 通过插值计算对应时刻的相机位姿
         SetFramePose(frames, lidars, config.T_cl, config.time_offset, config.data_gap_time);       
     }
-    // 用相机位姿设置雷达位姿
+    // 用相机位姿设置雷达位姿(当前未使用此选项)
     else 
     {
-        // 用图像位姿设置雷达位姿
+        // 输出日志表示使用相机-雷达外参设置雷达位姿
         LOG(INFO) << "Use T_cl to set lidar pose";
-        // 设置图像位姿
+        // 从SfM结果文件加载相机位姿
         LoadFramePose(frames, config.sfm_result_path + "/camera_pose_final.txt");
+        // 根据相机位姿、相机-雷达外参、时间偏移和数据间隔设置雷达位姿
         SetLidarPose(frames, lidars, config.T_cl, config.time_offset, config.data_gap_time);
     }
 
     #if 0
-    // 输出一下图像的id和图像名之间的对应关系，这样方便debug
+    // 这段代码被注释掉了，用于输出图像ID和图像名之间的对应关系，方便调试
+    // 将图像ID和文件名对应关系保存到文件
     ofstream image_id_name(config.result_path + "/image_id_name.txt");
     for(size_t i = 0; i < image_names_sync.size(); i++)
         image_id_name << i << "  " << image_names_sync[i] << endl;
     image_id_name.close();
 
+    // 将雷达ID和文件名对应关系保存到文件
     ofstream lidar_id_name(config.result_path + "/lidar_id_name.txt");
     for(size_t i = 0; i < lidar_names_sync.size(); i++)
         lidar_id_name << i << "  " << lidar_names_sync[i] << endl;
     lidar_id_name.close();
     #endif
 
+    // 开始计时联合优化过程
     t1 = chrono::high_resolution_clock::now();
+
+    // 创建相机-雷达优化器对象，传入初始外参、雷达数据、相机帧和配置
     CameraLidarOptimizer optimizer(config.T_cl, lidars, frames, config);
+    // 设置优化模式为MAPPING(用于多相机多雷达的整体位姿优化)
     optimizer.SetOptimizationMode(MAPPING);
+    // 提取图像中的直线特征，并启用可视化
     optimizer.ExtractImageLines(config.image_line_path, true);
+    // 提取激光雷达中的直线特征
     optimizer.ExtractLidarLines();
 
+    // 保存初始状态下融合的激光雷达点云(每5帧采样一次，0-40米范围内的点)
     pcl::io::savePCDFileBinary(config.joint_result_path + "/lidar_fuse_init.pcd", optimizer.FuseLidar(4, 0, 40));
 
+    // 执行联合优化，启用可视化
     optimizer.JointOptimize(true);
+
+    // 导出优化后的雷达位姿，包括无效位姿(参数true表示包含无效位姿)
     ExportPoseT(config.joint_result_path + "/lidar_pose_joint.txt", 
                 optimizer.GetLidarRotation(true), optimizer.GetLidarTranslation(true), optimizer.GetLidarNames(true));
+    // 导出优化后的相机位姿，包括无效位姿
     ExportPoseT(config.joint_result_path + "/camera_pose_joint.txt", 
                 optimizer.GetCameraRotation(true), optimizer.GetCameraTranslation(true), optimizer.GetImageNames(true));
+
+    // 导出优化后的3D点云结构
     optimizer.ExportStructureBinary(config.joint_result_path + "/points.bin");
+
+    // 保存优化后融合的激光雷达点云
     pcl::io::savePCDFileBinary(config.joint_result_path + "/lidar_fuse_final.pcd", optimizer.FuseLidar(4, 0, 40));
+
+    // 结束计时
     t2 = chrono::high_resolution_clock::now();
 
+    // 计算并记录联合优化过程的总耗时(秒)
     time_spent["camera-lidar optimization"] = chrono::duration_cast<chrono::duration<double> >(t2 - t1).count();
 
     return 0;

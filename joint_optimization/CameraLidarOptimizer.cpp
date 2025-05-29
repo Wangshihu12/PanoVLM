@@ -268,7 +268,9 @@ bool CameraLidarOptimizer::ExtractLidarLines(bool visualization)
 
 bool CameraLidarOptimizer::JointOptimize(bool visualization)
 {
+    // 输出日志标记联合优化开始
     LOG(INFO) << "============== Camera-LiDAR joint optimization begin ======================";
+    // 输出当前使用的配置信息，包括各种残差类型和权重设置
     LOG(INFO) << "Configuration: use angle - " << (config.angle_residual ? "true\r\n" : "false\r\n") << 
             "\t\t use point to line - " << (config.point_to_line_residual ? "true\r\n" : "false\r\n") << 
             "\t\t use line to line - " << (config.line_to_line_residual ? "true\r\n" : "false\r\n") <<
@@ -284,9 +286,16 @@ bool CameraLidarOptimizer::JointOptimize(bool visualization)
     // 对单帧进行直线关联，因为相当于雷达和相机是同步的，两者只有一个外参
     // 如果是要进行多相机多雷达的整体位姿优化，就要考虑一张图像和多个雷达进行关联，因为这时候相机和雷达
     // 不再同步，可以认为有n个外参（n=相机数 或 n=雷达数）
+
+    // 根据优化模式选择不同的处理流程
+    // CALIBRATION模式：用于标定相机和激光雷达之间的外参矩阵
+    // MAPPING模式：用于多相机多激光雷达的整体位姿优化
     if(optimization_mode == CALIBRATION)
     {
+        // 输出开始相机-激光雷达标定的日志
         LOG(INFO) << "start camera - LiDAR calibration";
+
+        // 检查相机帧数和激光雷达数据是否一致，不一致则截取相同数量
         if(lidars.size() != frames.size())
         {
             const size_t size = min(lidars.size(), frames.size());
@@ -294,31 +303,46 @@ bool CameraLidarOptimizer::JointOptimize(bool visualization)
             lidars = vector<Velodyne>(lidars.begin(), lidars.begin() + size);
             frames = vector<Frame>(frames.begin(), frames.begin() + size);
         }
+
+        // 使用初始外参进行直线特征关联
         Eigen::Matrix4d T_cl_last = T_cl_init;
         eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> line_pairs_all = AssociateLineSingle(T_cl_last);
-        // 显示投影结果，用于debug
+        
+        // 如果需要可视化，则保存初始匹配结果
         if(visualization)
         {
             Visualize(line_pairs_all, config.calib_result_path + "/init/");
         }
+
+        // 迭代优化外参，最多进行35次迭代
         for(int iter = 0; iter < 35; iter++)
         {
             LOG(INFO) << "iteration: " << iter ;
             
-            // 优化外参
+            // 基于当前关联的直线对优化外参
             Optimize(line_pairs_all, T_cl_last);
-            // 计算外参的变化量
+
+            // 计算外参的变化量（旋转和平移）
             Eigen::Matrix3d rotation_last = T_cl_last.block<3,3>(0,0);
             Eigen::Vector3d trans_last = T_cl_last.block<3,1>(0,3);
             Eigen::Matrix3d rotation_curr = T_cl_optimized.block<3,3>(0,0);
+
+            // 计算旋转变化量（角度）：使用旋转矩阵间的夹角公式
             float rotation_change = acos(((rotation_last.transpose() * rotation_curr).trace() - 1) / 2.0);
-            rotation_change *= 180.0 / M_PI;
+            rotation_change *= 180.0 / M_PI; // 转换为角度
+
+            // 计算平移变化量（欧氏距离）
             float trans_change = (trans_last - T_cl_optimized.block<3,1>(0,3)).norm();
             // 更新变化之后的外参
             T_cl_last = T_cl_optimized;
-            // 特征关联
+            
+            // 使用更新后的外参重新进行特征关联
             line_pairs_all = AssociateLineSingle(T_cl_last);
+
+            // 输出变化量信息
             LOG(INFO) << "rotation change: " << rotation_change << "  translate change: " << trans_change << endl;
+
+            // 收敛条件：如果旋转变化小于0.1度且平移变化小于0.01米，则提前结束迭代
             if(rotation_change < 0.1 && trans_change < 0.01)
                 break; 
         }
@@ -328,14 +352,19 @@ bool CameraLidarOptimizer::JointOptimize(bool visualization)
             Visualize(line_pairs_all, config.calib_result_path + "/final/");
         }
     }
-    else if(optimization_mode == MAPPING)
+    else if(optimization_mode == MAPPING) // 多相机多激光雷达的整体位姿优化
     {
         LOG(INFO) << "start camera-LiDAR mapping";
+
+        // 保存初始的相机和激光雷达位置用于可视化
         CameraCenterPCD(config.joint_result_path + "/camera_center_init.pcd", GetCameraTranslation());
         CameraCenterPCD(config.joint_result_path + "/lidar_center_init.pcd", GetLidarTranslation());
+
+        // 保存初始的相机和激光雷达位姿（包括方向）用于可视化
         CameraPoseVisualize(config.joint_result_path + "/camera_pose_init.ply", GetCameraRotation(), GetCameraTranslation());
         CameraPoseVisualize(config.joint_result_path + "/lidar_pose_init.ply", GetLidarRotation(), GetLidarTranslation());
 
+        // 决定是否重新进行图像特征点的三角化，此处条件为false，表示直接读取已有的三维点云结构
         if(false)
         {
             // 对图像特征点重新进行三角化
@@ -343,34 +372,51 @@ bool CameraLidarOptimizer::JointOptimize(bool visualization)
             ReadMatchPair(config.match_pair_joint_path, image_pairs, min(config.num_threads, 4));
             EstimateStructure(image_pairs);
         }
-        else 
+        else // 直接读取已有的三维点云结构
             ReadPointTracks(config.sfm_result_path + "points.bin", structure);
         
+        // 初始化优化变量
+        double last_cost = 0, curr_cost = 0; // 上一次和当前的代价值
+        int last_step = INT32_MAX, curr_step = INT32_MAX;  // 上一次和当前的迭代步数
 
-        double last_cost = 0, curr_cost = 0;
-        int last_step = INT32_MAX, curr_step = INT32_MAX; 
+        // 执行多相机和多激光雷达之间的直线特征关联
         eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> line_pairs_all = 
                     AssociateLineMulti(config.neighbor_size_joint, true, false);
+
+        // 迭代优化过程
         for(int iter = 0; iter < config.num_iteration_joint; iter++)
         {
             LOG(INFO) << "iteration: " << iter;
+
+            // 执行一次完整的联合优化：优化相机位姿、激光雷达位姿和三维结构
+            // 参数true表示优化相机旋转、相机平移、激光雷达旋转、激光雷达平移和三维结构
             Optimize(line_pairs_all, structure, true, true, true, true, true, curr_cost, curr_step);
+
+            // 保存当前迭代的相机和激光雷达位置与位姿
             CameraCenterPCD(config.joint_result_path + "/camera_center_" + num2str(iter) + ".pcd", GetCameraTranslation());
             CameraCenterPCD(config.joint_result_path + "/lidar_center_" + num2str(iter) + ".pcd", GetLidarTranslation());
             CameraPoseVisualize(config.joint_result_path + "/lidar_pose_" + num2str(iter) + ".ply", GetLidarRotation(), GetLidarTranslation());
             CameraPoseVisualize(config.joint_result_path + "/camera_pose_" + num2str(iter) + ".ply", GetCameraRotation(), GetCameraTranslation());
+            
+            // 清除上一次的关联结果，并重新进行特征关联
             line_pairs_all.clear();
             line_pairs_all =  AssociateLineMulti(config.neighbor_size_joint, true, false);   
+
+            // 检查收敛条件1：代价值变化小于1%
             if(abs(curr_cost - last_cost) / last_cost < 0.01)
             {
                 LOG(INFO) << "early termination condition fulfilled. cost change is less than 1%";
                 break;
             }
+
+            // 检查收敛条件2：连续两次迭代步数都小于5
             if(curr_step < 5 && last_step < 5)
             {
                 LOG(INFO) << "early termination condition fulfilled. iteration step is less than 5 steps in last two iterations";
                 break;
             }
+
+            // 更新上一次的代价值和迭代步数
             last_cost = curr_cost;
             last_step = curr_step;
     
@@ -380,51 +426,79 @@ bool CameraLidarOptimizer::JointOptimize(bool visualization)
             Visualize(line_pairs_all, config.joint_result_path + "/visualization/");
 
     }
-    else 
+    else  // 不支持的模式
     {
         LOG(ERROR) << "mode not supported";
         return false;
     }
+
+    // 输出日志标记联合优化结束
     LOG(INFO) << "============== Camera-LiDAR joint optimization end ======================";
     return true;
 }
 
-// {image id, lidar id} => {line pair}
-// 这个函数用于将相机图像中的直线和激光雷达点云中的直线进行关联匹配
-// 输入参数T_cl是相机到激光雷达的变换矩阵
-// 返回值是一个map,键是pair<图像id,激光雷达id>,值是对应的直线匹配对
+/**
+ * [功能描述]：将相机图像中的直线特征与激光雷达点云中的直线特征进行关联匹配
+ * 该函数用于标定模式(CALIBRATION)，处理同步的相机和激光雷达数据
+ * 假设图像帧和激光雷达帧是一一对应的，索引相同
+ * @param [T_cl]：相机到激光雷达的变换矩阵，用于将激光雷达点云投影到相机坐标系
+ * @return：返回直线匹配对的映射表，键是pair<图像id,激光雷达id>，值是对应的直线匹配对数组
+ */
 eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> CameraLidarOptimizer::AssociateLineSingle(Eigen::Matrix4d T_cl)
 {
-    // 设置OpenMP的线程数
+    // 设置OpenMP的线程数，用于并行加速处理
     omp_set_num_threads(config.num_threads);
-    // 用于存储所有的直线匹配对
+    
+    // 创建存储结果的映射表
+    // 键: pair<图像id, 激光雷达id>
+    // 值: 对应的直线匹配对数组
     eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> line_pairs_all;
-    // 并行处理每一帧图像
+    // 使用OpenMP并行处理每一帧图像
+    // schedule(dynamic)表示动态分配任务，适合工作负载不均衡的情况
     #pragma omp parallel for schedule(dynamic)
     for(size_t i = 0; i < frames.size(); i++)
     {
-        // 创建直线匹配器对象,传入图像的尺寸和灰度图
+        // 创建直线匹配器对象，传入当前图像的尺寸和灰度图像
+        // 用于执行图像直线和激光雷达直线的匹配
         CameraLidarLineAssociate associate(frames[i].GetImageRows(), frames[i].GetImageCols(), frames[i].GetImageGray());
-        // 如果激光雷达已经进行了边缘分割
+        
+        // 根据激光雷达数据的特征提取情况选择不同的匹配方法
         if(!lidars[i].edge_segmented.empty())
-            // 使用角度信息进行直线匹配
+            // 如果激光雷达已经进行了边缘分割(edge_segmented不为空)
+            // 使用更精确的基于角度的匹配方法
+            // 参数包括：
+            // - 图像直线
+            // - 激光雷达分割的边缘点
+            // - 线段系数
+            // - 角点特征
+            // - 点到线段的映射关系
+            // - 线段端点
+            // - 相机到激光雷达的变换矩阵
             associate.AssociateByAngle(image_lines_all[i].GetLines(), lidars[i].edge_segmented, lidars[i].segment_coeffs, 
                                 lidars[i].cornerLessSharp, lidars[i].point_to_segment, lidars[i].end_points, T_cl);
         else 
-            // 否则直接进行直线匹配
+            // 如果激光雷达没有进行边缘分割，则使用基本的匹配方法
+            // 直接根据图像直线和激光雷达角点进行匹配
             associate.Associate(image_lines_all[i].GetLines(), lidars[i].cornerLessSharp, T_cl);
-        // 临界区,将匹配结果存入map
+        // 临界区：多线程并行时需要保护共享资源line_pairs_all
+        // 确保同一时间只有一个线程可以修改line_pairs_all
         #pragma omp critical 
         {
+            // 将当前图像帧和对应激光雷达帧的匹配结果存入结果映射表
+            // 键为pair(i,i)，表示图像i和激光雷达i之间的匹配
+            // 注意在标定模式下，图像和激光雷达是一一对应的，所以键的两个元素相同
             line_pairs_all[pair<size_t, size_t>(i,i)] = associate.GetAssociatedPairs();;
         }
     }
     
     // 统计匹配的直线对数量
     size_t num_line_pairs = 0;
+    // 遍历映射表中的所有项，累加每对图像-激光雷达的匹配数量
     for(eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>>::const_iterator it = line_pairs_all.begin();
         it != line_pairs_all.end(); it++)
         num_line_pairs += it->second.size();
+
+    // 输出日志，记录匹配到的直线对总数
     LOG(INFO) << "Associate " << num_line_pairs << " line pairs";
 
     return line_pairs_all;
@@ -438,60 +512,92 @@ eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> CameraLid
 // - use_lidar_track: 是否使用激光雷达的跟踪信息
 // - use_image_track: 是否使用图像的跟踪信息
 // 返回值是一个map,键是pair<图像id,激光雷达id>,值是对应的直线匹配对
+
+/**
+ * [功能描述]：在多帧图像和激光雷达数据之间进行直线特征的关联匹配
+ * 该函数用于处理多相机多激光雷达的情况，可以匹配非同步的数据
+ * @param [neighbor_size]：每帧图像需要匹配的相邻激光雷达帧数
+ * @param [temporal]：是否考虑时序关系进行匹配，true表示按时间顺序匹配，false则基于空间位置关系匹配
+ * @param [use_lidar_track]：是否使用激光雷达的直线跟踪信息，用于筛选稳定的直线特征
+ * @param [use_image_track]：是否使用图像的直线跟踪信息，用于筛选稳定的直线特征
+ * @return：返回一个map，键是pair<图像id,激光雷达id>，值是对应的直线匹配对数组
+ */
 eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> CameraLidarOptimizer::AssociateLineMulti(
         const int neighbor_size, const bool temporal, const bool use_lidar_track, const bool use_image_track)
 {
-    // 设置OpenMP的线程数
+    // 设置OpenMP的线程数，用于并行加速处理
     omp_set_num_threads(config.num_threads);
+    // 输出日志信息，记录当前邻域大小
     LOG(INFO) << "Associate lines, neighbor size = " << neighbor_size;
     
-    // 为每个图像帧找到用于匹配的相邻激光雷达帧
+    // 为每个图像帧找到需要匹配的相邻激光雷达帧
+    // 如果temporal为true，则按时间顺序选择相邻帧
+    // 如果temporal为false，则按空间位置选择相邻帧
     vector<vector<int>> each_frame_neighbor = NeighborEachFrame(neighbor_size, temporal);
     
-    // 如果使用跟踪信息,创建掩码数组
+    // 创建掩码数组，用于筛选特征
+    // 对于每个图像/激光雷达，掩码数组指示哪些直线特征可以用于匹配
     vector<vector<bool>> image_mask_all(frames.size()), lidar_mask_all(lidars.size());
+
+    // 如果使用激光雷达跟踪信息，创建激光雷达掩码
+    // 只有在多帧中跟踪到的稳定直线才会被设置为true
     if(use_lidar_track)
         lidar_mask_all = LidarMaskByTrack();
+
+    // 如果使用图像跟踪信息，创建图像掩码
+    // 只有在多帧中跟踪到的稳定直线才会被设置为true
     if(use_image_track)
         image_mask_all = ImageMaskByTrack();
         
-    // 用于存储所有的直线匹配对
+    // 用于存储所有的直线匹配对结果
+    // 键：pair<图像id, 激光雷达id>
+    // 值：对应的直线匹配对数组
     eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> line_pairs_all;
     
-    // 并行处理每一帧图像
+    // 使用OpenMP并行处理每一帧图像
+    // schedule(dynamic)表示动态分配任务，适合负载不均匀的情况
     #pragma omp parallel for schedule(dynamic)
     for(size_t frame_id = 0; frame_id < frames.size(); frame_id++)
     {
         // 遍历当前图像帧的所有相邻激光雷达帧
         for(const int& lidar_id : each_frame_neighbor[frame_id])
         {
+            // 获取当前处理的激光雷达对象
             const Velodyne& lidar = lidars[lidar_id];
-            // 计算相机到激光雷达的变换矩阵
+            // 计算相机到激光雷达的变换矩阵T_cl
+            // 初始值设为初始外参
             Eigen::Matrix4d T_cl = T_cl_init;
+
+            // 如果相机和激光雷达都有有效位姿，则计算它们之间的相对变换
+            // T_cl = T_wc.inverse() * T_wl，即将激光雷达坐标变换到相机坐标系
             if(frames[frame_id].IsPoseValid() && lidar.IsPoseValid())
             {
-                Eigen::Matrix4d T_wc = frames[frame_id].GetPose();
-                Eigen::Matrix4d T_wl = lidar.GetPose();
-                T_cl = T_wc.inverse() * T_wl;
+                Eigen::Matrix4d T_wc = frames[frame_id].GetPose(); // 世界到相机的变换
+                Eigen::Matrix4d T_wl = lidar.GetPose(); // 世界到激光雷达的变换
+                T_cl = T_wc.inverse() * T_wl; // 相机到激光雷达的变换
             }
             
-            // 创建直线匹配器对象
+            // 创建直线匹配器对象，传入图像的尺寸信息
             CameraLidarLineAssociate associate(frames[frame_id].GetImageRows(), frames[frame_id].GetImageCols());
             
-            // 根据激光雷达是否已经进行直线拟合选择不同的匹配方式
+            // 根据激光雷达是否已经进行了边缘分割，选择不同的匹配策略
             if(!lidar.edge_segmented.empty())
-                // 使用角度信息进行直线匹配
+                // 如果激光雷达已进行边缘分割，则使用角度信息进行直线匹配
+                // 参数包括：图像直线、激光雷达边缘分割点、线段系数、角点、点到线段映射、端点、变换矩阵
+                // 以及是否考虑3D因素、图像掩码和激光雷达掩码
                 associate.AssociateByAngle(image_lines_all[frame_id].GetLines(), lidar.edge_segmented, lidar.segment_coeffs,
                              lidar.cornerLessSharp, lidar.point_to_segment, lidar.end_points, T_cl, true, 
                              image_mask_all[frame_id], lidar_mask_all[lidar_id]);
             else 
-                // 直接进行直线匹配
+                // 如果激光雷达没有进行边缘分割，则直接进行基本的直线匹配
+                // 只考虑图像直线和激光雷达角点之间的对应关系
                 associate.Associate(image_lines_all[frame_id].GetLines(), lidar.cornerLessSharp, T_cl);
                 
-            // 获取匹配结果
+            // 获取匹配结果：成功匹配的相机-激光雷达直线对
             vector<CameraLidarLinePair> pairs = associate.GetAssociatedPairs();
             
-            // 临界区,将匹配结果存入map
+            // 临界区：将匹配结果存入全局map
+            // 由于多线程并行处理，需要使用临界区保护共享数据
             #pragma omp critical
             {
                 line_pairs_all[pair<size_t,size_t>(frame_id, lidar_id)] = pairs;
@@ -504,6 +610,8 @@ eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> CameraLid
     for(eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>>::const_iterator it = line_pairs_all.begin();
         it != line_pairs_all.end(); it++)
         num_line_pairs += it->second.size();
+
+    // 输出日志，记录匹配到的直线对总数
     LOG(INFO) << "Associate " << num_line_pairs << " line pairs";
     
     return line_pairs_all;
@@ -521,83 +629,104 @@ eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>> CameraLid
 // - cost: 输出优化后的代价值
 // - steps: 输出优化迭代步数
 
+/**
+ * [功能描述]：对相机和激光雷达的位姿以及三维结构进行联合优化
+ * @param [line_pairs]：相机和激光雷达之间匹配的直线对，用于添加约束
+ * @param [structure]：三角化得到的3D点云结构
+ * @param [refine_camera_rotation]：是否优化相机的旋转
+ * @param [refine_camera_trans]：是否优化相机的平移
+ * @param [refine_lidar_rotation]：是否优化激光雷达的旋转
+ * @param [refine_lidar_trans]：是否优化激光雷达的平移
+ * @param [refine_structure]：是否优化3D点云结构
+ * @param [cost]：输出参数，优化后的代价值
+ * @param [steps]：输出参数，优化迭代步数
+ * @return：优化是否成功，1表示成功，0表示失败
+ */
 int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, std::vector<CameraLidarLinePair>>& line_pairs, 
                 std::vector<PointTrack>& structure, const bool refine_camera_rotation,
                  const bool refine_camera_trans, const bool refine_lidar_rotation, 
                 const bool refine_lidar_trans, const bool refine_structure,
                 double& cost, int& steps)
 {
-    // 1. 取出所有相机和激光雷达的位姿,转换为轴角表示进行优化
+    // 1. 提取所有相机和激光雷达的位姿，并转换为轴角表示形式用于优化
     eigen_vector<Eigen::Vector3d> angleAxis_cw_list(frames.size()), angleAxis_lw_list(lidars.size());
     eigen_vector<Eigen::Vector3d> t_cw_list(frames.size()), t_lw_list(lidars.size());
     pcl::PointCloud<pcl::PointXYZI> lidar_center;
     
-    // 提取相机位姿
+    // 提取相机位姿：将世界到相机的变换矩阵转换为相机到世界的变换
+    // 并将旋转矩阵转换为轴角表示形式
     for(size_t i = 0; i < frames.size(); i++) {
         if(!frames[i].IsPoseValid())
             continue;
-        Eigen::Matrix4d T_cw = frames[i].GetPose().inverse();
-        Eigen::Matrix3d R_cw = T_cw.block<3,3>(0,0);
-        ceres::RotationMatrixToAngleAxis(R_cw.data(), angleAxis_cw_list[i].data());
-        t_cw_list[i] = T_cw.block<3,1>(0,3);
+        Eigen::Matrix4d T_cw = frames[i].GetPose().inverse(); // 相机到世界的变换
+        Eigen::Matrix3d R_cw = T_cw.block<3,3>(0,0);          // 提取旋转部分
+        ceres::RotationMatrixToAngleAxis(R_cw.data(), angleAxis_cw_list[i].data()); // 转换为轴角表示
+        t_cw_list[i] = T_cw.block<3,1>(0,3);                  // 提取平移部分
     }
     
-    // 提取激光雷达位姿
+    // 提取激光雷达位姿：将世界到激光雷达的变换矩阵转换为激光雷达到世界的变换
+    // 并将旋转矩阵转换为轴角表示形式
     for(size_t i = 0; i < lidars.size(); i++) {
         if(!lidars[i].IsPoseValid() || !lidars[i].valid)
             continue;
-        Eigen::Matrix4d T_wl = lidars[i].GetPose();
-        Eigen::Matrix4d T_lw = T_wl.inverse();
-        Eigen::Matrix3d R_lw = T_lw.block<3,3>(0,0);
-        ceres::RotationMatrixToAngleAxis(R_lw.data(), angleAxis_lw_list[i].data());
-        t_lw_list[i] = T_lw.block<3,1>(0,3);
-        lidars[i].Transform2LidarWorld();
+        Eigen::Matrix4d T_wl = lidars[i].GetPose();           // 世界到激光雷达的变换
+        Eigen::Matrix4d T_lw = T_wl.inverse();                // 激光雷达到世界的变换
+        Eigen::Matrix3d R_lw = T_lw.block<3,3>(0,0);          // 提取旋转部分
+        ceres::RotationMatrixToAngleAxis(R_lw.data(), angleAxis_lw_list[i].data()); // 转换为轴角表示
+        t_lw_list[i] = T_lw.block<3,1>(0,3);                  // 提取平移部分
+        lidars[i].Transform2LidarWorld();                      // 将激光雷达点云转换到世界坐标系
     }
     
     // 2. 构建优化问题
     ceres::Problem problem;
-    ceres::LossFunction* loss_function1 = new ceres::HuberLoss(3 * M_PI / 180.0);  // 夹角阈值为3度
+    ceres::LossFunction* loss_function1 = new ceres::HuberLoss(3 * M_PI / 180.0);  // 使用Huber损失函数，阈值为3度
     
     // 3. 添加各类约束
-    // 添加相机-激光雷达之间的约束
+    // 添加相机-激光雷达之间的约束（主要是通过匹配的直线对）
     size_t residual_camera_lidar = AddCameraLidarResidual(frames, lidars,
                     angleAxis_cw_list, t_cw_list, angleAxis_lw_list, t_lw_list, 
                     line_pairs, loss_function1, problem, config.camera_lidar_weight);
     LOG(INFO) << "num residual blocks for camera-lidar : " << residual_camera_lidar;
 
-    // 添加相机-相机之间的重投影约束
+    // 添加相机-相机之间的重投影约束（通过三角化的3D点）
     size_t residual_camera = AddCameraResidual(frames, angleAxis_cw_list, t_cw_list, structure, 
                         problem, RESIDUAL_TYPE::ANGLE_RESIDUAL_1, config.camera_weight);
     LOG(INFO) << "num residual blocks for camera-camera: " << residual_camera;
 
-    // 添加激光雷达-激光雷达之间的约束
-    vector<vector<int>> neighbors = FindNeighbors(lidars, 6);
+    // 添加激光雷达-激光雷达之间的约束（点到线、线到线、点到面）
+    vector<vector<int>> neighbors = FindNeighbors(lidars, 6);  // 查找每个激光雷达的6个最近邻
     size_t residual_lidar = 0;
+    
+    // 根据配置添加点到线约束
     if(config.point_to_line_residual)
         residual_lidar += AddLidarPointToLineResidual(neighbors, lidars, angleAxis_lw_list, t_lw_list, problem, 
                                 config.point_to_line_dis_threshold, config.angle_residual, config.normalize_distance, config.lidar_weight);
+    
+    // 根据配置添加线到线约束
     if(config.line_to_line_residual) {
         LidarLineMatch matcher(lidars);
-        matcher.SetNeighborSize(4);
-        matcher.SetMinTrackLength(3);
-        matcher.GenerateTracks();
+        matcher.SetNeighborSize(4);               // 设置近邻大小为4
+        matcher.SetMinTrackLength(3);             // 设置最小跟踪长度为3
+        matcher.GenerateTracks();                 // 生成直线跟踪
         residual_lidar += AddLidarLineToLineResidual2(neighbors, lidars, angleAxis_lw_list, t_lw_list, problem, matcher.GetTracks(),
                                     config.point_to_line_dis_threshold, config.angle_residual, config.normalize_distance);
     }
+    
+    // 根据配置添加点到面约束
     if(config.point_to_plane_residual)
         residual_lidar += AddLidarPointToPlaneResidual(neighbors, lidars, angleAxis_lw_list, t_lw_list, problem, 
                                 config.point_to_plane_dis_threshold, config.lidar_plane_tolerance, config.angle_residual, 
                                 config.normalize_distance, config.lidar_weight);
     LOG(INFO) << "num residual blocks for lidar-lidar: " << residual_lidar;
 
-    // 4. 根据参数设置固定部分变量
-    // 固定3D点云结构
+    // 4. 根据参数设置固定部分变量（不参与优化）
+    // 如果不优化3D点云结构，则将其参数块设为常量
     if(refine_structure == false) {
         for(const PointTrack& track : structure)
             problem.SetParameterBlockConstant(track.point_3d.data());
     }
     
-    // 固定相机位姿
+    // 根据参数设置是否固定相机的旋转和平移
     for(size_t i = 0 ; i < frames.size(); i++) {
         if(frames[i].IsPoseValid()) {
             if(refine_camera_rotation == false)
@@ -607,7 +736,7 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
         }
     }
     
-    // 固定激光雷达位姿
+    // 根据参数设置是否固定激光雷达的旋转和平移
     for(size_t i = 0 ; i < lidars.size(); i++) {
         if(lidars[i].IsPoseValid() && lidars[i].valid) {
             if(refine_lidar_rotation == false)
@@ -617,20 +746,20 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
         }
     }    
 
-    // 固定第一帧相机位姿作为参考坐标系
+    // 固定第一帧相机位姿作为参考坐标系，防止整体漂移
     problem.SetParameterBlockConstant(angleAxis_cw_list[0].data());
     problem.SetParameterBlockConstant(t_cw_list[0].data());
 
-    // 5. 求解优化问题
+    // 5. 配置求解器参数并求解优化问题
     LOG(INFO) << "total residual blocks : " << problem.NumResidualBlocks();
-    ceres::Solver::Options options = SetOptionsSfM(config.num_threads);
+    ceres::Solver::Options options = SetOptionsSfM(config.num_threads);  // 设置求解器参数
     ceres::Solver::Summary summary;
-    ceres::Solve(options, &problem, &summary);
+    ceres::Solve(options, &problem, &summary);   // 求解优化问题
     
-    // 6. 检查优化结果
+    // 6. 检查优化结果是否可用
     if(!summary.IsSolutionUsable()) {
-        LOG(INFO) << summary.FullReport();
-        // 保存失败时的位姿用于调试
+        LOG(INFO) << summary.FullReport();  // 输出详细报告
+        // 保存失败时的位姿到文件，用于调试
         ofstream f(config.joint_result_path + "/camera_pose_fail.txt");
         for(size_t i = 0; i < angleAxis_cw_list.size(); i++)
             f << angleAxis_cw_list[i].x() << " " << angleAxis_cw_list[i].y() << " " << angleAxis_cw_list[i].z() << " " 
@@ -645,9 +774,10 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
         return false;
     }
     
-    // 7. 更新优化后的位姿
-    LOG(INFO) << summary.BriefReport();
-    // 更新相机位姿
+    // 7. 优化成功，更新相机和激光雷达的位姿
+    LOG(INFO) << summary.BriefReport();  // 输出简要报告
+    
+    // 更新相机位姿：将优化后的轴角表示转换回旋转矩阵，构建变换矩阵并更新
     for(size_t i = 0; i < frames.size(); i++) {
         if(!frames[i].IsPoseValid())
             continue;
@@ -657,88 +787,133 @@ int CameraLidarOptimizer::Optimize(const eigen_map<std::pair<size_t, size_t>, st
         Eigen::Matrix4d T_cw = Eigen::Matrix4d::Identity();
         T_cw.block<3,3>(0,0) = R_cw;
         T_cw.block<3,1>(0,3) = t_cw;
-        frames[i].SetPose(T_cw.inverse());
+        frames[i].SetPose(T_cw.inverse());  // 设置为世界到相机的变换
     }
 
-    // 更新激光雷达位姿
+    // 更新激光雷达位姿：使用OpenMP并行处理以提高效率
     #pragma omp parallel for 
     for(size_t i = 0; i < lidars.size(); i++) {
         if(!lidars[i].IsPoseValid())
             continue;
-        // 如果雷达在世界坐标系下，需要先转换到局部坐标系再更新位姿
+        // 如果雷达点云在世界坐标系下，需要先转换回局部坐标系再更新位姿
         if(lidars[i].IsInWorldCoordinate())
             lidars[i].Transform2Local();
+        
+        // 将优化后的轴角表示转换回旋转矩阵，构建变换矩阵并更新
         Eigen::Matrix3d R_lw;
         ceres::AngleAxisToRotationMatrix(angleAxis_lw_list[i].data(), R_lw.data());
         Eigen::Vector3d t_lw = t_lw_list[i];
         Eigen::Matrix4d T_lw = Eigen::Matrix4d::Identity();
         T_lw.block<3,3>(0,0) = R_lw;
         T_lw.block<3,1>(0,3) = t_lw;
-        lidars[i].SetPose(T_lw.inverse());
+        lidars[i].SetPose(T_lw.inverse());  // 设置为世界到激光雷达的变换
     }
     
-    // 8. 返回优化结果
+    // 8. 返回优化结果：最终代价和迭代步数
     cost = summary.final_cost;
     steps = summary.num_successful_steps;
-    return 1;
+    return 1;  // 返回成功
 }
 
-
+/**
+ * [功能描述]：为每一帧图像查找需要进行特征匹配的相邻激光雷达帧
+ * 有两种查找模式：基于时间顺序或基于空间位置
+ * @param [neighbor_size]：每帧图像需要匹配的相邻激光雷达帧数量
+ * @param [temporal]：是否基于时间顺序查找，true表示按时间序列查找，false表示按空间位置查找
+ * @return：返回每帧图像对应的激光雷达帧索引列表
+ */
 std::vector<std::vector<int>> CameraLidarOptimizer::NeighborEachFrame(const int neighbor_size, const bool temporal)
 {
+    // 创建结果数组，为每一帧图像分配一个向量用于存储相邻激光雷达的索引
     vector<vector<int>> each_frame_neighbor(frames.size());
+
+    // 时间序列模式：根据帧索引的先后顺序来确定相邻关系
     if(temporal)
     {
+        // 遍历每一帧图像
         for(int frame_id = 0; frame_id < frames.size(); frame_id++)
         {
-            // 确定LiDAR的起始和结尾，注意结尾是不包含在近邻范围内的。这里的方法就是先确定LiDAR的起始位置，
-            // 根据起始位置和neighbor size确定结尾。然后把结尾限制在lidrs.size()内，接着根据结尾反过来确定起始
-            // 这样就能保证图像都有相同数量的近邻了，只有一种是例外，也就是neighbor size > lidars.size
+            // 确定激光雷达帧的起始和结束索引
+            // 策略：先确定起始位置，再确定结束位置，再调整起始位置，确保每帧都有相同数量的邻居
+            // 初步确定起始位置：当前帧索引减去邻域大小的一半，但不小于0
             int lidar_id_start = max(0, frame_id - (neighbor_size / 2));
+
+            // 初步确定结束位置：起始位置加上邻域大小，但不超过激光雷达总数
             int lidar_id_end = min(static_cast<int>(lidars.size()), lidar_id_start + neighbor_size);
+
+            // 重新调整起始位置：确保范围内恰好有neighbor_size个激光雷达帧（如果可能）
             lidar_id_start = max(0, lidar_id_end - neighbor_size);
+
+            // 将该范围内的所有激光雷达帧添加为当前图像帧的邻居
             for(int lidar_id = lidar_id_start; lidar_id < lidar_id_end; lidar_id++)
                 each_frame_neighbor[frame_id].push_back(lidar_id);
         }
     }
-    else 
+    else  // 空间位置模式：根据3D空间中的位置距离来确定相邻关系
     {
+        // 创建点云存储所有激光雷达的中心位置
         pcl::PointCloud<PointType> lidar_center;
+
+        // 遍历所有激光雷达，提取其在世界坐标系中的位置
         for(size_t i = 0; i < lidars.size(); i++)
         {
+            // 跳过没有有效位姿或标记为无效的激光雷达
             if(!lidars[i].IsPoseValid() || !lidars[i].valid)
                 continue;
+
+                // 创建一个点来表示激光雷达的中心位置
             PointType center;
             Eigen::Vector3d t_wl = lidars[i].GetPose().block<3,1>(0,3);
             center.x = t_wl.x();
             center.y = t_wl.y();
             center.z = t_wl.z();
-            // 设置intensity只是为了知道当前的点对应于哪一帧雷达，因为可能有的雷达没有位姿就没被记录下来
+            // 使用intensity字段存储激光雷达的原始索引
+            // 这是因为可能有些激光雷达被跳过，需要记录点与原始激光雷达的对应关系
             center.intensity = i;   
+
+            // 将激光雷达中心点添加到点云中
             lidar_center.push_back(center);
         }
+
+        // 创建KD树用于最近邻搜索
         pcl::KdTreeFLANN<PointType>::Ptr kd_center(new pcl::KdTreeFLANN<PointType>());
         kd_center->setInputCloud(lidar_center.makeShared());
+
+        // 用于存储临时的邻居索引
         vector<int> neighbors;
         for(int i = 0; i < frames.size(); i++)
         {
+            // 跳过没有有效位姿的图像
             if(!frames[i].IsPoseValid())
                 continue;
+
+            // 创建一个点来表示图像在世界坐标系中的位置
             PointType center;
             Eigen::Vector3d t_wl = frames[i].GetPose().block<3,1>(0,3);
             center.x = t_wl.x();
             center.y = t_wl.y();
             center.z = t_wl.z();
+
+            // 使用KD树查找离当前图像位置最近的neighbor_size个激光雷达
             kd_center->nearestKSearch(center, neighbor_size, neighbors, *(new vector<float>()));
+
+            // 将找到的点云索引转换回原始激光雷达索引
             for(int& n_idx : neighbors)
             {
                 n_idx = lidar_center[n_idx].intensity;
             }
+
+            // 将邻居列表转换为集合，便于快速查找
             set<int> neighbors_set(neighbors.begin(), neighbors.end());
+
+            // 额外添加时序上的前后邻居（如果它们不在KD树找到的邻居中）
+            // 这样既考虑了空间距离，又考虑了时序关系
             if(neighbors_set.count(i - 1) == 0 && (i - 1 >= 0))
-                neighbors.push_back(i - 1);
+                neighbors.push_back(i - 1); // 添加前一帧（如果存在）
             if(neighbors_set.count(i + 1) == 0 && (i + 1 < lidars.size()))
-                neighbors.push_back(i + 1);
+                neighbors.push_back(i + 1); // 添加后一帧（如果存在）
+
+            // 保存当前图像的所有邻居
             each_frame_neighbor[i] = neighbors;
         }
     }
