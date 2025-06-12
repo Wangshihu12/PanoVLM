@@ -12,32 +12,83 @@ SfM::SfM(const Config& _config):config(_config)
 {
     track_triangulated = false;
 }
+
 bool SfM::ReadImages(const vector<string>& image_names, const cv::Mat& mask)
 {
+    // 输出日志信息，标记图像读取和特征提取流程的开始
     LOG(INFO) << "=============== Read image and extract features begin ==============" << endl;
+    
+    // 设置OpenMP并行线程数为配置文件中指定的线程数
+    // 这样可以充分利用多核CPU进行并行计算，加速特征提取过程
     omp_set_num_threads(config.num_threads);
+    
+    // 清空frames容器，确保从干净的状态开始处理
     frames.clear();
-    // 目前假设所有图像的分辨率都是相同的
+    
+    // 读取第一张图像来获取图像尺寸信息
+    // 这里假设所有图像的分辨率都是相同的，这在SLAM/SfM应用中是常见的假设
     cv::Mat img = cv::imread(image_names[0]);
+    
+    // 创建进度条对象，用于显示处理进度
+    // 参数：总任务数为图像数量，进度更新间隔为0.1（即每完成10%显示一次）
     ProcessBar bar(image_names.size(), 0.1);
+    
+    // 使用OpenMP并行处理所有图像
+    // schedule(dynamic)：动态调度，适合处理时间不均匀的任务
+    // 因为不同图像的特征点数量可能差异很大，动态调度能更好地平衡负载
     #pragma omp parallel for schedule(dynamic)
     for(int i = 0; i < image_names.size(); i++)
     {
+        // 为每张图像创建Frame对象
+        // 参数：图像高度、宽度、图像ID、图像文件路径
         Frame frame(img.rows, img.cols, i, image_names[i]);
+        
+        // 加载图像的灰度版本到内存
+        // 大多数特征检测算法（如SIFT）都在灰度图像上工作
         frame.LoadImageGray(frame.name);
+        
+        // 提取图像的关键点（特征点）
+        // config.num_sift：要提取的SIFT特征点数量上限
+        // mask：掩码图像，指定在图像的哪些区域提取特征点
+        //       mask为空的区域不会提取特征点，可用于排除天空、车辆等动态区域
         frame.ExtractKeyPoints(config.num_sift, mask);
+        
+        // 为每个关键点计算描述子（特征描述符）
+        // config.root_sift：是否使用RootSIFT，这是SIFT的改进版本
+        // 描述子用于后续的特征匹配，是一个高维向量，描述了特征点周围的图像信息
         frame.ComputeDescriptor(config.root_sift);
+        
+        // 释放灰度图像的内存，节省内存空间
+        // 因为后续处理不再需要原始图像数据，只需要提取出的特征点和描述子
         frame.ReleaseImageGray();
+        
+        // OpenMP临界区：确保多线程安全地访问共享资源
+        // 因为frames是所有线程共享的容器，需要互斥访问避免数据竞争
         #pragma omp critical 
         {
+            // 将处理完的Frame对象加入到frames容器中
             frames.push_back(frame);
+            
+            // 更新进度条，显示当前处理进度
             bar.Add();
         }
     }
-    // 对frame按id大小排列，因为经过openmp乱序执行
-    sort(frames.begin(), frames.end(), [this](Frame& a, Frame& b){return a.id < b.id;});
+    
+    // 对frames按照id进行排序
+    // 由于OpenMP的并行执行，frames中的元素顺序可能被打乱
+    // 排序确保frames中的元素按照原始图像顺序排列，这对后续处理很重要
+    sort(frames.begin(), frames.end(), [this](Frame& a, Frame& b){
+        return a.id < b.id;  // 按照Frame的id从小到大排序
+    });
+    
+    // 输出处理结果的统计信息
     LOG(INFO) << "Read " << frames.size() << " images";
+    
+    // 输出日志信息，标记图像读取和特征提取流程的结束
     LOG(INFO) << "=============== Read image and extract features end ==============" << endl;
+    
+    // 返回是否成功处理了图像
+    // 如果frames.size() > 0说明至少处理了一张图像，返回true；否则返回false
     return frames.size() > 0;
 }
 
@@ -48,45 +99,89 @@ bool SfM::LoadFrameBinary(const std::string& image_path, const std::string& fram
 
 bool SfM::InitImagePairs(const int frame_match_type)
 {
+    // 清空现有的图像匹配对，从干净状态开始
     image_pairs.clear();
+    
+    // === 策略1：穷举匹配（EXHAUSTIVE） ===
+    // 如果匹配类型包含穷举匹配标志位
     if(frame_match_type & FrameMatchMethod::EXHAUSTIVE)
     {
         LOG(INFO) << "init match pairs with exhausive match";
+        // 穷举所有可能的图像对组合
+        // 对于N张图像，会生成N*(N-1)/2个匹配对
+        // 这种方法最完整但计算量巨大，通常只在图像数量较少时使用
         for(int i = 0; i < frames.size(); i++)
             for(int j = i + 1; j < frames.size(); j++)
-                image_pairs.push_back(MatchPair(i,j));
+                image_pairs.push_back(MatchPair(i,j));  // 创建图像i和图像j的匹配对
         return image_pairs.size() > 0;
     }
-    // 图像对的初始生成方式是可以组合的，也就是说可以同时使用VLAD和连续匹配，这种情况下也会有很多重复
-    // 为了避免出现重复的匹配对，就需要用一个set来保存已有的匹配对的图像id
+    
+    // === 组合策略处理 ===
+    // 图像对的初始生成方式是可以组合的，比如可以同时使用VLAD和连续匹配
+    // 为了避免出现重复的匹配对，使用set来记录已有的匹配对
+    // set会自动去重，确保每个图像对只出现一次
     set<pair<size_t,size_t>> pairs;
+    
+    // === 策略2：连续匹配（CONTIGUOUS） ===
+    // 如果匹配类型包含连续匹配标志位
     if(frame_match_type & FrameMatchMethod::CONTIGUOUS)
     {
+        // 设置邻域大小，每张图像只与其后续的20张图像进行匹配
         int neighbor_size = 20;
         LOG(INFO) << "init match pairs with contiguous match, neighbor size = " << neighbor_size;
+        
+        // 基于图像序列的连续性进行匹配
+        // 假设相邻的图像更可能有重叠区域和共同特征
+        // 这种策略适用于按时间顺序或空间顺序排列的图像序列
         for(int i = 0; i < frames.size(); i++)
             for(int j = i + 1; j < i + neighbor_size && j < frames.size(); j++)
             {
                 image_pairs.push_back(MatchPair(i,j));
-                pairs.insert({i, j});
+                pairs.insert({i, j});  // 记录这个匹配对，避免后续重复添加
             }
     }
+    
+    // === 策略3：VLAD匹配 ===
+    // 如果匹配类型包含VLAD匹配标志位
     if(frame_match_type & FrameMatchMethod::VLAD)
     {
+        // 动态计算邻域大小：总图像数的1/40，但不少于15
+        // 这样可以根据数据集大小自适应调整匹配策略
         int neighbor_size = max(int(frames.size() / 40), 15);
         LOG(INFO) << "init match pairs with VLAD, neighbor size = " << neighbor_size;
+        
+        // 创建VLAD匹配器
+        // VLAD (Vector of Locally Aggregated Descriptors) 是一种图像检索方法
+        // 它可以将图像表示为紧凑的特征向量，用于快速的图像相似性比较
         VLADMatcher vlad(frames, config, RESIDUAL_NORMALIZATION_PWR_LAW);
+        
+        // 生成词典（CodeBook）
+        // 参数0.5可能是词典大小的比例或其他相关参数
         vlad.GenerateCodeBook(0.5);
+        
+        // 为每张图像计算VLAD嵌入向量
+        // 将每张图像的特征转换为固定维度的VLAD描述符
         vlad.ComputeVLADEmbedding();
+        
+        // 为每张图像找到最相似的邻居图像
+        // 返回每张图像的neighbor_size个最相似图像的索引
         std::vector<std::vector<size_t>> neighbors_all = vlad.FindNeighbors(neighbor_size);
+        
+        // 遍历每张图像及其邻居，生成匹配对
         for(size_t i = 0; i < frames.size(); i++)
         {
             for(const size_t& neighbor : neighbors_all[i])
             {
+                // 跳过自己与自己的匹配
                 if(neighbor == i)
                     continue;
+                
+                // 确保匹配对的id按从小到大排序，避免重复
+                // 例如：(3,5)和(5,3)实际上是同一个匹配对
                 size_t min_id = min(i, neighbor);
                 size_t max_id = max(i, neighbor);
+                
+                // 检查这个匹配对是否已经存在
                 if(pairs.count({min_id, max_id}) == 0)
                 {
                     image_pairs.push_back(MatchPair(min_id, max_id));
@@ -95,35 +190,57 @@ bool SfM::InitImagePairs(const int frame_match_type)
             }
         }
     }
+    
+    // === 策略4：GPS匹配 ===
+    // 如果匹配类型包含GPS匹配标志位
     if(frame_match_type & FrameMatchMethod::GPS)
     {
-        int neighbor_size = 15;
-        float distance_threshold = 7;
+        int neighbor_size = 15;           // 每个位置最多匹配15个邻居
+        float distance_threshold = 7;     // GPS距离阈值7米
         LOG(INFO) << "init match pairs with GPS, neighbor size = " << neighbor_size << ", distance threshold = " << distance_threshold;
+        
+        // 尝试加载GPS数据
         if(LoadGPS(config.gps_path))
         {
-            // 记录下每个图像的位置, 为了之后进行近邻搜索
+            // 将每张图像的GPS位置记录为点云格式，便于进行空间搜索
             pcl::PointCloud<pcl::PointXYZI> frame_center;
             for(size_t i = 0; i < frames.size(); i++)
             {
-                pcl::PointXYZI pt(i);
+                pcl::PointXYZI pt(i);  // intensity字段存储图像索引
+                // 将GPS坐标转换为PCL点格式
                 EigenVec2PclPoint(frames[i].GetGPS(), pt);
                 frame_center.push_back(pt);
             }
+            
+            // 构建KD树用于快速近邻搜索
+            // KD树是一种高效的空间数据结构，可以快速找到最近邻点
             pcl::KdTreeFLANN<pcl::PointXYZI>::Ptr kd_center(new pcl::KdTreeFLANN<pcl::PointXYZI>());
             kd_center->setInputCloud(frame_center.makeShared());
+            
+            // 为每个GPS位置寻找空间上的邻居
             for(const pcl::PointXYZI& pt : frame_center)
             {
-                vector<float> sq_neighbor_dist;
-                vector<int> neighbor_ids;
+                vector<float> sq_neighbor_dist;  // 存储邻居的平方距离
+                vector<int> neighbor_ids;        // 存储邻居的索引
+                
+                // 搜索最近的neighbor_size+1个点（包括自己）
                 kd_center->nearestKSearch(pt, neighbor_size + 1, neighbor_ids, sq_neighbor_dist);
+                
+                // 遍历找到的邻居（跳过第一个，因为是自己）
                 for(size_t i = 1; i < neighbor_ids.size(); i++)
                 {
+                    // 如果距离超过阈值，停止处理（因为结果是按距离排序的）
                     if(sq_neighbor_dist[i] > Square(distance_threshold))
                         break;
-                    pair<size_t,size_t> curr_pair(min(pt.intensity, frame_center[neighbor_ids[i]].intensity), max(pt.intensity, frame_center[neighbor_ids[i]].intensity));
+                    
+                    // 创建匹配对，确保id按从小到大排序
+                    pair<size_t,size_t> curr_pair(min(pt.intensity, frame_center[neighbor_ids[i]].intensity), 
+                                                  max(pt.intensity, frame_center[neighbor_ids[i]].intensity));
+                    
+                    // 检查是否已存在这个匹配对
                     if(pairs.count(curr_pair) > 0)
                         continue;
+                    
                     pairs.insert(curr_pair);
                     image_pairs.push_back(MatchPair((size_t)pt.intensity, (size_t)frame_center[neighbor_ids[i]].intensity));
                 }
@@ -132,29 +249,44 @@ bool SfM::InitImagePairs(const int frame_match_type)
         else 
             LOG(ERROR) << "Unable to init match pairs with GPS";
     }
+    
+    // === 策略5：GPS+VLAD组合匹配 ===
+    // 如果匹配类型包含GPS_VLAD匹配标志位
     if(frame_match_type & FrameMatchMethod::GPS_VLAD)
     {
-        int neighbor_size = frames.size() / 40;
-        float distance_threshold = 20;
+        int neighbor_size = frames.size() / 40;  // 邻居数量与总图像数成比例
+        float distance_threshold = 20;           // GPS距离阈值20米（比纯GPS匹配更宽松）
         LOG(INFO) << "init match pairs with VLAD and filter with GPS, neighbor size = " << neighbor_size << ", distance threshold = " << distance_threshold;;
+        
+        // 确保GPS数据可用
         if(LoadGPS(config.gps_path))
         {
+            // 首先使用VLAD找到视觉上相似的图像
             VLADMatcher vlad(frames, config, RESIDUAL_NORMALIZATION_PWR_LAW);
             vlad.GenerateCodeBook(0.5);
             vlad.ComputeVLADEmbedding();
             std::vector<std::vector<size_t>> neighbors_all = vlad.FindNeighbors(neighbor_size);
+            
+            // 遍历VLAD找到的邻居，但用GPS距离进行过滤
             for(size_t i = 0; i < frames.size(); i++)
             {
                 for(const size_t& neighbor : neighbors_all[i])
                 {
                     if(neighbor == i)
                         continue;
+                    
                     size_t min_id = min(i, neighbor);
                     size_t max_id = max(i, neighbor);
+                    
+                    // 计算两张图像GPS位置之间的欧几里得距离
                     double gps_distance = (frames[min_id].GetGPS() - frames[max_id].GetGPS()).norm();
-                    // GPS 距离大于阈值，过滤掉
+                    
+                    // 如果GPS距离大于阈值，过滤掉这个匹配对
+                    // 这样可以排除视觉相似但空间位置相距很远的图像（如重复场景）
                     if(gps_distance > distance_threshold)
                         continue;
+                    
+                    // 添加通过GPS距离验证的匹配对
                     if(pairs.count({min_id, max_id}) == 0)
                     {
                         image_pairs.push_back(MatchPair(min_id, max_id));
@@ -164,231 +296,434 @@ bool SfM::InitImagePairs(const int frame_match_type)
             }
         }
     }
+    
+    // 返回是否成功生成了图像匹配对
     return image_pairs.size() > 0;
 }
 
 bool SfM::ComputeDepthImage(const Eigen::Matrix4d T_cl)
 {
+    // 输出日志信息，标记深度图计算流程的开始
     LOG(INFO) << "=================== Compute Depth Image begin =====================";
-    // 目前假设图像和雷达的数目是一样的，且初始的外参基本正确
+    
+    // 检查激光雷达数据和图像帧的数量是否匹配
+    // 在相机-激光雷达融合系统中，通常要求每个图像帧都有对应的激光雷达数据
+    // 这样才能为每张图像生成对应的深度图
     if(lidars.size() != frames.size())
     {
         LOG(ERROR) << "warning: lidar size != frame size" << endl;
-        return false;
+        return false;  // 数量不匹配则返回失败
     }
+    
+    // 判断是否需要保存深度图到本地文件
+    // 如果config.depth_path不为空，说明需要保存深度图
     bool save_depth = !config.depth_path.empty();
+    
+    // 如果需要保存深度图且目标目录不存在，则创建目录
     if(save_depth && !boost::filesystem::exists(config.depth_path))
     {
         boost::filesystem::create_directory(config.depth_path);
         LOG(INFO) << "save depth image in " << config.depth_path;
     }
 
+    // 创建深度图可视化结果的保存路径
+    // 可视化图像通常是将深度信息用伪彩色表示，便于人眼观察
     string visualize_path = config.sfm_result_path + "/depth_visualize";
     if(!boost::filesystem::exists(visualize_path))
         boost::filesystem::create_directory(visualize_path);
 
+    // 设置是否使用半分辨率来生成深度图
+    // 使用半分辨率可以大大节约内存和计算时间，通常对最终效果影响不大
     bool half_size = true;
+    
+    // 设置OpenMP并行线程数
     omp_set_num_threads(config.num_threads);
+    
+    // 创建进度条，用于显示深度图计算进度
     ProcessBar bar(lidars.size(), 0.1);
+    
+    // 使用OpenMP并行处理每个激光雷达数据
+    // schedule(dynamic)：动态调度，适合处理时间不均匀的任务
     #pragma omp parallel for schedule(dynamic)
     for(size_t i = 0; i < lidars.size(); i++)
     {
-        // 从所有雷达数据中复制一份，这样读取完点云后直接就释放了，不会占内存
+        // 从原始雷达数据中复制一份用于当前线程处理
+        // 这样做的好处是：读取完点云数据后可以立即释放内存，避免同时加载所有雷达数据
         Velodyne lidar(lidars[i]);
+        
+        // 从文件中加载当前雷达的点云数据到内存
+        // 雷达点云通常包含XYZ坐标和强度信息
         lidar.LoadLidar(lidar.name);
+        
+        // 声明深度图变量
         cv::Mat depth;
-        // 深度图只用一半的分辨率即可，可以大大节约内存
+        
+        // 根据是否使用半分辨率来生成深度图
         if(half_size)
+        {
+            // 使用半分辨率：将图像的行列数各减半（+1是为了处理奇数尺寸）
+            // ProjectLidar2PanoramaDepth函数将3D雷达点云投影到2D全景深度图
+            // 参数说明：
+            // - lidar.cloud: 输入的雷达点云
+            // - (frames[i].GetImageRows() + 1) / 2: 目标深度图的行数（半分辨率）
+            // - (frames[i].GetImageCols() + 1) / 2: 目标深度图的列数（半分辨率）
+            // - T_cl: 相机到激光雷达的外参变换矩阵
+            // - 4: 可能是距离阈值或其他参数
             depth = ProjectLidar2PanoramaDepth(lidar.cloud, (frames[i].GetImageRows() + 1) / 2, 
                             (frames[i].GetImageCols() + 1) / 2, T_cl, 4);
+        }
         else 
+        {
+            // 使用全分辨率生成深度图
             depth = ProjectLidar2PanoramaDepth(lidar.cloud, frames[i].GetImageRows(), 
                             frames[i].GetImageCols(), T_cl, 4);
-        depth = DepthCompletion(depth, config.max_depth);       // 深度补全后是CV_32F的真实深度
+        }
+        
+        // 深度补全：填充由于雷达点云稀疏而产生的深度图空洞
+        // 雷达点云通常比较稀疏，直接投影得到的深度图会有很多空洞
+        // DepthCompletion函数使用插值等方法填充这些空洞
+        // config.max_depth: 最大有效深度值，超过此值的深度被认为无效
+        // 函数返回CV_32F格式的真实深度值（单位通常是米）
+        depth = DepthCompletion(depth, config.max_depth);
+        
+        // 如果需要保存深度图到本地
         if(save_depth)
         {
-            // 把深度图和彩色图结合起来，得到更好的可视化效果
+            // === 生成可视化图像 ===
+            // 获取对应图像帧的彩色图像
             cv::Mat depth_with_color = frames[i].GetImageColor();
+            
+            // 如果使用半分辨率，需要将彩色图像也缩放到相同尺寸
             if(half_size)
-                cv::pyrDown(depth_with_color, depth_with_color);
+                cv::pyrDown(depth_with_color, depth_with_color);  // 图像金字塔下采样
+            
+            // 将深度信息与RGB图像结合，生成可视化图像
+            // 通常是将深度信息用伪彩色叠加在RGB图像上
+            // config.max_depth_visual: 可视化时的最大深度值
             depth_with_color = CombineDepthWithRGB(depth, depth_with_color, config.max_depth_visual);
+            
+            // 保存可视化结果为JPEG图像
             cv::imwrite(visualize_path + "/depth_" + num2str(i) + ".jpg", depth_with_color);
-            // 变成CV_16U的形式，虽然会损失一点精度，但是大大节约了内存
+            
+            // === 保存原始深度图 ===
+            // 将深度值乘以256，为转换为16位整数做准备
+            // 这样可以在保持一定精度的同时大大节约存储空间
             depth *= 256.f;
-            depth.convertTo(depth, CV_16U);                         
-            // 把深度图保存到本地
+            
+            // 转换为16位无符号整数格式
+            // CV_32F转换为CV_16U虽然会损失一些精度，但存储空间减少一半
+            depth.convertTo(depth, CV_16U);
+            
+            // 将深度图以二进制格式保存到本地文件
+            // 二进制格式比图像格式保存更精确，加载也更快
             ExportOpenCVMat(config.depth_path + num2str(i) + ".bin", depth);
         }
+        
+        // 更新进度条
         bar.Add();
     }
+    
+    // 输出日志信息，标记深度图计算流程的结束
     LOG(INFO) << "=================== Compute Depth Image end ===================";
-    return true;
+    return true;  // 成功完成所有深度图的计算
 }
 
 
 bool SfM::MatchImagePairs(const int matches_threshold)
 {
+    // 输出日志信息，标记图像对匹配流程的开始
     LOG(INFO) << "========= Match Image Pairs begin ===========" << endl;
+    
+    // 创建容器存储通过匹配筛选的图像对
     vector<MatchPair> good_pair;
-    set<size_t> covered_frames;     // 记录一下被image pair覆盖的frame个数，没有实际作用，只是用来输出一下
+    
+    // 记录被图像对覆盖的帧数量，主要用于统计和日志输出
+    // 这个变量帮助了解有多少帧参与了匹配，评估匹配的覆盖度
+    set<size_t> covered_frames;
+    
+    // 设置OpenMP并行线程数
     omp_set_num_threads(config.num_threads);
+
+    // === CUDA加速相关设置 ===
 #ifdef USE_CUDA
+    // 检查是否可以使用CUDA加速
+    // 需要同时满足：配置允许使用CUDA 且 系统有可用的CUDA设备
     bool use_cuda = config.use_cuda && (cv::cuda::getCudaEnabledDeviceCount() > 0);
+    
+    // 创建GPU内存中的描述符数组，用于存储所有图像的SIFT描述符
     vector<cv::cuda::GpuMat> d_descriptors(frames.size());
+    
+    // 如果使用CUDA，将所有图像的描述符从CPU内存上传到GPU内存
     if(use_cuda)
     {
+        // 并行上传所有图像的描述符到GPU
+        // 这样可以避免在匹配过程中重复进行CPU-GPU数据传输
         #pragma omp parallel for
         for(size_t i = 0; i < frames.size(); i++)
             d_descriptors[i].upload(frames[i].GetDescriptor());
     }
 #else 
+    // 如果编译时没有CUDA支持，则不使用CUDA
     bool use_cuda = false;
 #endif
-    // 第一步：通过SIFT特征匹配，过滤掉不合适的匹配关系
+    
+    // === SIFT特征匹配过程 ===
+    // 输出匹配策略信息
     LOG(INFO) << "match image pair with SIFT, " << (use_cuda ? "use cuda" : "use cpu"); 
     LOG(INFO) << "init pair : " << image_pairs.size() << endl;
     
+    // 创建进度条，显示匹配进度
     ProcessBar bar1(image_pairs.size(), 0.1);
+    
+    // 使用OpenMP并行处理所有图像对
+    // schedule(dynamic)：动态调度，适合处理时间不均匀的任务
+    // 因为不同图像对的特征点数量差异很大，匹配时间也会有显著差异
     #pragma omp parallel for schedule(dynamic)
     for(int i = 0; i < image_pairs.size(); i++)
     {
+        // 更新进度条
         bar1.Add(1);
+        
+        // 获取当前图像对的源图像和目标图像索引
         size_t source = image_pairs[i].image_pair.first;
         size_t target = image_pairs[i].image_pair.second;
+        
+        // 存储SIFT匹配结果
         vector<cv::DMatch> matches;
+        
+        // 根据是否使用CUDA选择不同的匹配方法
 #ifdef USE_CUDA
         if(use_cuda)
+            // 使用GPU加速的SIFT匹配
+            // 在GPU内存中直接进行描述符匹配，速度更快
             matches = MatchSIFT(d_descriptors[source], d_descriptors[target], config.sift_match_dist_threshold);
         else 
 #endif
+            // 使用CPU进行SIFT匹配
+            // 从CPU内存中读取描述符进行匹配
             matches = MatchSIFT(frames[source].GetDescriptor(), frames[target].GetDescriptor(), config.sift_match_dist_threshold);
-                                            
+        
+        // === 第一轮过滤：基于匹配数量 ===
+        // 如果匹配点数量少于阈值，直接跳过这个图像对
+        // 匹配点太少通常意味着两张图像重叠区域很小或者没有共同场景
         if(matches.size() < matches_threshold)
             continue;
+        
+        // === 第二轮过滤：基于匹配质量 ===
+        // 找到所有匹配中距离最大的那个匹配
+        // 这里distance越小表示匹配越好，所以最大distance对应最差的匹配
         vector<cv::DMatch>::iterator it_max = max_element(matches.begin(), matches.end());
+        
+        // 创建容器存储高质量的匹配
         vector<cv::DMatch> good_matches;
-        // 用匹配距离再去筛选一遍，得到更准确的匹配效果
+        
+        // 应用比例测试（Ratio Test）进行匹配筛选
+        // 只保留距离小于最大距离80%的匹配
+        // 这是Lowe在SIFT论文中提出的经典筛选方法，可以有效去除模糊匹配
         for(vector<cv::DMatch>::iterator it = matches.begin(); it != matches.end(); it++)
             if(it->distance < 0.8 * it_max->distance)
                 good_matches.push_back(*it);
+        
+        // 再次检查筛选后的匹配数量是否足够
         if(int(good_matches.size()) < matches_threshold)
             continue;
+        
+        // === 保存通过筛选的图像对 ===
+        // 使用临界区保护，确保多线程安全地访问共享数据
         #pragma omp critical
         {
+            // 将通过筛选的图像对和其匹配结果保存
             good_pair.push_back(MatchPair(source, target, good_matches));
+            
+            // 记录参与匹配的图像帧
             covered_frames.insert(source);
             covered_frames.insert(target);
-            // 画出匹配关系
+            
+            // === 可选的匹配可视化 ===
+            // 下面的代码被注释掉了，如果需要可以取消注释来生成匹配可视化图像
+            // 这对调试和分析匹配质量很有帮助
             // cv::Mat matches_vertical = DrawMatchesVertical(frames[source].GetImageColor(), frames[source].GetKeyPoints(),
             //                         frames[target].GetImageColor(), frames[target].GetKeyPoints(), good_matches);
             // cv::imwrite(config.sfm_result_path + "/sift_" + num2str(source) + "_" + num2str(target) + ".jpg", matches_vertical);
         }
     }
+    
+    // === 更新图像对列表 ===
+    // 将筛选后的图像对替换原来的图像对列表
+    // swap操作比赋值更高效，直接交换两个容器的内容
     good_pair.swap(image_pairs);
+    
+    // === 输出统计信息 ===
     LOG(INFO) << "after filter with SIFT : " << image_pairs.size() << " image pairs, with " <<
              covered_frames.size() << " frames" << endl;
+    
+    // === 保存结果 ===
+    // 将筛选后的图像对结果保存到文本文件
+    // 这个文件可以用于后续流程的快速加载，避免重复计算
     ExportMatchPairTXT(config.sfm_result_path + "/after_sift_match.txt");
+    
+    // === 内存清理 ===
+    // 释放所有图像的描述符内存
+    // 描述符通常占用大量内存，匹配完成后可以释放以节省内存
     for(size_t i = 0; i < frames.size(); i++)
         frames[i].ReleaseDescriptor();
+    
+    // 输出日志信息，标记图像对匹配流程的结束
     LOG(INFO) << "========= Match Image Pairs end ===========" << endl;
-    return true;
+    
+    return true;  // 返回成功
 }
 
 
 bool SfM::FilterImagePairs(const int triangulation_num_threshold , const float triangulation_angle_threshold, const bool keep_no_scale )
 {
     LOG(INFO) << "=========== Filter Image Pairs begin ================";
+    
+    // 设置OpenMP并行线程数
     omp_set_num_threads(config.num_threads);
+    
+    // 记录被覆盖的图像帧，用于统计
     set<size_t> covered_frames;
+    
+    // 记录初始图像对数量，用于后续统计过滤效果
     size_t num_pairs_init = image_pairs.size(); 
-    // 这几个数是用来统计匹配的图像对分别是由于什么缘故被过滤掉的，可以辅助分析一下SfM表现不好的原因
-    size_t estimate_essential_fail = 0 ,            // 无法估计本质矩阵
-            decompose_essential_fail = 0,           // 无法分解本质矩阵得到好的相对位姿
-            refine_pose_fail = 0,                   // 优化相对位姿时失败
-            no_scale = 0,                           // 无法计算尺度
-            no_connection = 0;                      // 不满足边双联通 bi-edge-connection
+    
+    // === 统计变量：记录各种过滤原因 ===
+    // 这些统计数据有助于分析SfM性能瓶颈和调试算法
+    size_t estimate_essential_fail = 0 ,            // 无法估计本质矩阵的图像对数量
+            decompose_essential_fail = 0,           // 无法分解本质矩阵得到好的相对位姿的数量
+            refine_pose_fail = 0,                   // 优化相对位姿时失败的数量
+            no_scale = 0,                           // 无法计算尺度的数量
+            no_connection = 0;                      // 不满足边双联通 bi-edge-connection 的数量
 
+    // === 坐标系转换：从图像坐标到球面坐标 ===
+    // 创建等距柱状投影对象，用于全景图像的坐标转换
     Equirectangular eq(frames[0].GetImageRows(), frames[0].GetImageCols());
-    // 把所有二维特征点投影到单位球上
+    
+    // 将所有图像的2D特征点投影到单位球面上
+    // 这是全景SLAM中的标准做法，因为全景图像覆盖360度视野
     vector<vector<cv::Point3f>> key_points_sphere(frames.size());
     for(size_t i = 0; i < frames.size(); i++)
     {
         const vector<cv::KeyPoint>& key_points = frames[i].GetKeyPoints();
         for(auto& kp : key_points)
+            // 将图像像素坐标转换为单位球面上的3D坐标
             key_points_sphere[i].push_back(eq.ImageToCam(kp.pt));
     }
+    
+    // 存储通过几何验证的图像对
     vector<MatchPair> good_pair;
+    
+    // === 并行处理每个图像对 ===
     #pragma omp parallel for schedule(dynamic)
     for(const MatchPair& p : image_pairs)
     {
+        // 获取当前图像对的索引
         size_t idx1 = p.image_pair.first;
         size_t idx2 = p.image_pair.second;
+        
+        // 获取两张图像在球面上的特征点
         const vector<cv::Point3f>& keypoints1 = key_points_sphere[idx1];
         const vector<cv::Point3f>& keypoints2 = key_points_sphere[idx2];
+        
+        // 存储每次迭代的结果
         vector<MatchPair> pair_each_iter;
+        // 存储每个结果的内点数量和索引，用于排序选择最佳结果
         vector<pair<int,int>> inlier_each_pair;
+        
+        // === 多次迭代寻找最佳相对位姿 ===
+        // 由于RANSAC的随机性，多次迭代可以提高找到最优解的概率
         for(int iter = 0; iter < 40; iter++)
         {
-            // 计算本质矩阵E
+            // === 步骤1：估计本质矩阵 ===
             Eigen::Matrix3d essential;
             vector<size_t> inlier_idx;
-            // 使用AC-RANSAC计算
-            double error_upper_bound = 5.0 * M_PI / 180.0;      // 设置误差的上限为5度
+            
+            // 设置重投影误差上限为5度
+            // 这个阈值考虑了全景图像的特点和特征点检测的精度
+            double error_upper_bound = 5.0 * M_PI / 180.0;
+            
+            // 创建AC-RANSAC的NFA（Number of False Alarms）评估器
+            // 参数：样本数量、模型最小样本数(8点法)、是否使用log scale
             ACRansac_NFA nfa(p.matches.size(), 8, false);
+            
+            // 使用AC-RANSAC算法估计本质矩阵
+            // AC-RANSAC相比标准RANSAC更加稳健，能自动确定内点阈值
             essential = FindEssentialACRANSAC(p.matches, keypoints1, keypoints2, 300, 
                         error_upper_bound, nfa, inlier_idx);
+            
+            // 如果无法估计出有效的本质矩阵，跳过这次迭代
             if(essential.isZero())
                 continue;
             
-            // 本质矩阵分解得到4组R t
+            // === 步骤2：分解本质矩阵 ===
+            // 本质矩阵分解可以得到4组可能的相对位姿(R, t)
             eigen_vector<Eigen::Matrix3d> rotations;
             eigen_vector<Eigen::Vector3d> trans;
             DecomposeEssential(essential, rotations, trans);
 
-            // 找到4组R t 中最正确的那个
-            vector<double> parallax(rotations.size());
-            vector<int> num_pts(rotations.size(), 0);
-            vector<eigen_vector<Eigen::Vector3d>> triangulated_points(rotations.size());
-            vector<vector<size_t>> inliers(rotations.size());
-            // 只使用计算本质矩阵的内点去进行三角化来检测R t的正确性
+            // === 步骤3：通过三角化验证正确的相对位姿 ===
+            // 为4组候选位姿分别进行评估
+            vector<double> parallax(rotations.size());                              // 视差角度
+            vector<int> num_pts(rotations.size(), 0);                              // 成功三角化的点数
+            vector<eigen_vector<Eigen::Vector3d>> triangulated_points(rotations.size()); // 三角化得到的3D点
+            vector<vector<size_t>> inliers(rotations.size());                      // 每组位姿的内点索引
+            
+            // 创建内点标记数组，只使用计算本质矩阵时的内点进行三角化
+            // 这样可以避免外点对位姿验证的干扰
             vector<bool> inlier(p.matches.size(), false);
             for(const size_t& idx : inlier_idx)
                 inlier[idx] = true;
+            
+            // 对每组候选位姿进行三角化测试
             for(size_t j = 0; j < rotations.size(); j++)
                 num_pts[j] = CheckRT(rotations[j], trans[j], inlier, p.matches, 
                             keypoints1, keypoints2, parallax[j], triangulated_points[j], inliers[j]);
             
+            // === 步骤4：选择最佳位姿 ===
+            // 找到能三角化出最多有效3D点的位姿
             vector<int>::iterator max_points_idx = max_element(num_pts.begin(), num_pts.end());
             int best_idx = max_points_idx - num_pts.begin();
-            // 三角化的点数量太少，过滤掉
+            
+            // 如果三角化的点数量太少，说明这个图像对质量不好，跳过
             if(*max_points_idx < triangulation_num_threshold)
             {
                 continue;
             }
-            // 视差太小，过滤掉
+            
+            // === 可选的视差检查（当前被注释） ===
+            // 视差太小的图像对容易导致三角化不稳定
             // if(parallax[best_idx] < 1)
             // {
             //     little_parallax++;
             //     continue;
             // }
+            
+            // 检查是否有多个位姿都能三角化出大量点
+            // 如果有多个位姿都表现很好，说明这个图像对的几何约束不够强
             int num_similar = count_if(num_pts.begin(), num_pts.end(), 
                             [max_points_idx](unsigned int num_points){return num_points > 0.8 * (*max_points_idx);});
-            // 有多个位姿都能三角化出大量三维点，过滤掉
+            
+            // 有多个位姿都能三角化出大量三维点，过滤掉这个图像对
             if(num_similar > 1)
             {
                 continue;
             }
 
-            // 注意这个里面没有保存匹配的特征点对，因为对于每次迭代的结果来说，匹配的特征点对都是相同的
+            // === 保存有效的相对位姿结果 ===
+            // 注意：这里没有保存匹配的特征点对，因为对于每次迭代来说匹配点都是相同的
             MatchPair match_pair(p.image_pair.first, p.image_pair.second);
-            match_pair.R_21 = rotations[best_idx];
-            match_pair.t_21 = trans[best_idx];
-            match_pair.triangulated = triangulated_points[best_idx];
-            match_pair.inlier_idx = inliers[best_idx];
+            match_pair.R_21 = rotations[best_idx];                    // 相对旋转矩阵
+            match_pair.t_21 = trans[best_idx];                        // 相对平移向量
+            match_pair.triangulated = triangulated_points[best_idx];  // 三角化得到的3D点
+            match_pair.inlier_idx = inliers[best_idx];               // 内点索引
 
             pair_each_iter.push_back(match_pair);
+            // 记录内点数量和结果索引，用于后续排序
             inlier_each_pair.push_back({match_pair.inlier_idx.size(), inlier_each_pair.size()});            
         }
+        
+        // 如果所有迭代都失败了，记录失败原因并跳过
         if(pair_each_iter.empty())
         {
             estimate_essential_fail++;
@@ -396,7 +731,8 @@ bool SfM::FilterImagePairs(const int triangulation_num_threshold , const float t
         }
 
         #if 0
-        // 输出一下每次迭代的结果，用于debug
+        // === 调试代码：输出每次迭代的结果 ===
+        // 可以用于分析算法性能和调试
         ofstream f(config.sfm_result_path +  num2str(p.image_pair.first) + "_" + num2str(p.image_pair.second) + ".txt");
         for(const MatchPair& pair : pair_each_iter)
         {
@@ -408,15 +744,19 @@ bool SfM::FilterImagePairs(const int triangulation_num_threshold , const float t
         }
         #endif 
 
-        // 对每次的结果排序，按照内点数量从大到小排列
-        // first - 内点数量， second - 索引
+        // === 选择最终的最佳结果 ===
+        // 按照内点数量从大到小排序
+        // first - 内点数量， second - 在pair_each_iter中的索引
         sort(inlier_each_pair.begin(), inlier_each_pair.end(), 
             [](const pair<int,int>& a, const pair<int,int>& b){return a.first > b.first;});
 
+        // 选择内点数量最多的结果
         int best_idx = inlier_each_pair[0].second;
+        
         #if 0
-        // 限制相邻帧之间旋转的角度，最大角度 = 帧数差异 * 1.5度，也就是说限制连续两帧之间旋转角度不能超过1.5度
-        // 这个比较适用于车载的场景
+        // === 可选的旋转角度约束（当前被注释） ===
+        // 限制相邻帧之间旋转的角度，适用于车载等连续运动场景
+        // 最大角度 = 帧数差异 * 1.5度，限制连续两帧之间旋转角度不能超过1.5度
         double rotation_angle_threshold = (p.image_pair.second - p.image_pair.first) * 1.5 / 180.0 * M_PI;
         for(const auto& idx : inlier_each_pair)
         {
@@ -432,28 +772,44 @@ bool SfM::FilterImagePairs(const int triangulation_num_threshold , const float t
             continue;
         }
         #endif 
+        
+        // 将原始匹配点信息添加到最佳结果中
         pair_each_iter[best_idx].matches = p.matches;
+        
+        // === 步骤5：精化相对位姿 ===
+        // 使用非线性优化进一步提高相对位姿的精度
         if(!RefineRelativePose(pair_each_iter[best_idx]))
         {
             refine_pose_fail ++;
-            // continue;
+            // continue;  // 即使精化失败也保留结果（当前设置）
         }
+        
+        // 线程安全地添加到结果列表
         #pragma omp critical
         {
             good_pair.push_back(pair_each_iter[best_idx]);
         }
     }
 
+    // 更新图像对列表为通过几何验证的结果
     image_pairs = good_pair;
     
-    /* 计算相对平移的尺度 */
+    // === 步骤6：设置相对平移的尺度 ===
     LOG(INFO) << "start to set relative translation scale";
+    // 使用深度图信息为相对平移设置真实的物理尺度
+    // 没有深度信息的相对位姿只能确定方向，无法确定距离
     SetTranslationScaleDepthMap(keep_no_scale);
     no_scale = good_pair.size() - image_pairs.size();
+    
     size_t tmp = image_pairs.size();
-    // 根据边双连通过滤
+    
+    // === 步骤7：图连通性过滤 ===
+    // 根据边双连通性过滤图像对，确保重建图的连通性
+    // 只保留最大的双连通子图，去除孤立的图像对
     image_pairs = LargestBiconnectedGraph(image_pairs, covered_frames);
     no_connection = tmp - image_pairs.size();
+    
+    // === 输出统计信息 ===
     LOG(INFO) << "count of image pairs with valid relative motion : " << image_pairs.size() << " image pairs, with " <<
              covered_frames.size() << " frames" << endl;
     LOG(INFO) << "filter " << num_pairs_init - image_pairs.size() << " image pairs" << 
@@ -462,9 +818,11 @@ bool SfM::FilterImagePairs(const int triangulation_num_threshold , const float t
                 "\r\n\t\t filter by refine pose fail : " << refine_pose_fail <<
                 "\r\n\t\t filter by no scale : " << no_scale << 
                 "\r\n\t\t filter by not bi-connected : " << no_connection; 
-    // 经过上面openmp的并行操作后，image_pair的顺序就被打乱了，重新按图像的索引排序，排列成
-    // 0-1  0-2  0-3  0-4 ... 1-2  1-3  1-4 ... 2-3  2-4  ... 3-4 这样的顺序
-    // 这里不排序也是可以的，只是为了后面debug方便才排序的
+    
+    // === 重新排序图像对 ===
+    // 经过并行操作后图像对的顺序被打乱，重新按图像索引排序
+    // 排列成 0-1, 0-2, 0-3, 0-4, ..., 1-2, 1-3, 1-4, ..., 2-3, 2-4, ..., 3-4 的顺序
+    // 这样便于后续处理和调试
     sort(image_pairs.begin(), image_pairs.end(), 
         [this](const MatchPair& mp1,const MatchPair& mp2)
         {
@@ -777,24 +1135,69 @@ std::vector<MatchPair> SfM::FilterByTriplet(const std::vector<MatchPair>& init_p
     return pairs_after_triplet_filter;
 }
 
+/**
+ * [功能描述]：从图像匹配对中提取最大的边双连通子图
+ * 
+ * 边双连通图的重要性：
+ * - 在SfM中，图像对形成一个图结构，每张图像是节点，匹配关系是边
+ * - 边双连通性确保图中任意两点间至少有两条边不相交的路径
+ * - 这保证了位姿图的鲁棒性：即使删除任意一条边，图仍然连通
+ * - 对于全局位姿估计和Bundle Adjustment至关重要
+ * 
+ * @param pairs [输入参数]：所有图像匹配对的列表，每个MatchPair包含两张图像的索引和匹配关系
+ * @param nodes [输出参数]：最大边双连通子图中包含的节点(图像)索引集合，通过引用返回
+ * @return：属于最大边双连通子图的图像匹配对列表
+ */
 std::vector<MatchPair> SfM::LargestBiconnectedGraph(const std::vector<MatchPair>& pairs, std::set<size_t>& nodes)
 {
+    // === 步骤1：构建边集合 ===
+    // 将图像匹配对转换为图论中的边集合表示
+    // 每个MatchPair代表两张图像之间存在足够的特征匹配，可以估计相对位姿
     set<pair<size_t, size_t>> edges;
     for(const MatchPair& p : pairs)
+        // 将图像对 (image1_id, image2_id) 作为图中的边加入边集合
+        // emplace比insert更高效，直接在容器中构造对象
         edges.emplace(p.image_pair);
+    
+    // === 步骤2：创建位姿图对象 ===
+    // PoseGraph是专门处理SLAM中位姿图的类
+    // 它实现了图论算法来分析图像网络的连通性和鲁棒性
     PoseGraph graph(edges);
+    
+    // === 步骤3：寻找最大边双连通子图 ===
+    // 清空输出节点集合，准备存储新结果
     nodes.clear();
+    
+    // 调用图算法找到最大的边双连通子图中的所有节点
+    // 边双连通子图的特点：
+    // 1. 图中任意两个节点间至少存在两条边不相交的路径
+    // 2. 删除任意一条边后，图仍然连通
+    // 3. 这确保了位姿估计的鲁棒性和稳定性
     nodes = graph.KeepLargestEdgeBiconnected();
+    
+    // === 步骤4：处理边界情况 ===
+    // 如果没有找到有效的边双连通子图，返回空结果
+    // 这种情况可能发生在：
+    // - 图像匹配质量很差
+    // - 数据集太小或图像重叠不足
+    // - 所有图像对都是孤立的
     if(nodes.empty())
         return vector<MatchPair>();
     
+    // === 步骤5：过滤匹配对 ===
+    // 只保留属于最大边双连通子图的图像匹配对
     vector<MatchPair> good_pair;
     for(const MatchPair& p : pairs)
     {
-        if(nodes.count(p.image_pair.first) > 0 &&
-            nodes.count(p.image_pair.second) > 0)
-            good_pair.push_back(p);
+        // 检查当前匹配对的两张图像是否都在最大边双连通子图中
+        // 只有当两张图像都在子图中时，这个匹配对才有效
+        if(nodes.count(p.image_pair.first) > 0 &&     // 第一张图像在子图中
+           nodes.count(p.image_pair.second) > 0)      // 第二张图像在子图中
+            good_pair.push_back(p);                    // 保留这个匹配对
     }
+    
+    // 返回过滤后的匹配对列表
+    // 这些匹配对形成一个边双连通的图结构，适合进行全局优化
     return good_pair;
 }
 
@@ -811,65 +1214,103 @@ bool SfM::RemoveFarPoints(double scale)
 bool SfM::EstimateGlobalRotation(const int method)
 {
     LOG(INFO) << "================ Estimate Global Rotation begin ================";
+    
+    // === 可选的GPS尺度设置（当前被注释） ===
+    // 如果有GPS数据，可以用GPS信息设置平移的真实尺度
     // if(!config.gps_path.empty())
     //     SetTranslationScaleGPS(config.gps_path, true);
     
+    // === 可选的直线运动过滤（当前被注释） ===
+    // 过滤掉直线运动的图像序列，因为直线运动容易导致退化情况
     // FilterByStraightMotion(100);
     
-    // 如果只使用有尺度的图像对进行旋转平均，那么就只保留有尺度的图像对
+    // === 步骤1：选择性使用有尺度的图像对 ===
+    // 根据配置决定是否只使用有尺度信息的图像对进行旋转平均
+    // 有尺度的图像对通常质量更高，约束更强
     if(!config.use_all_pairs_ra)
     {
         vector<MatchPair> pairs_with_scale;
         for(const MatchPair& p : image_pairs)
         {
+            // 检查图像对是否有有效的尺度信息
+            // upper_scale和lower_scale是通过深度图或其他传感器信息计算出的尺度边界
             if(p.upper_scale >= 0 && p.lower_scale >= 0)
                 pairs_with_scale.push_back(p);
         }
+        // 用有尺度的图像对替换原来的图像对列表
         pairs_with_scale.swap(image_pairs);
         LOG(INFO) << "Only use pairs with scale to estimate global rotation, " << image_pairs.size() << " pairs";
     }
     
-    // 输出相对位姿到文件中，用于debug
+    // === 调试输出（当前被注释） ===
+    // 输出相对位姿到文件中，用于分析和调试
     // PrintRelativePose(config.sfm_result_path + "relpose-RA-before-filter.txt");
 
+    // === 步骤2：确保图的边双连通性 ===
     set<size_t> covered_frames;
+    // 保留最大的边双连通子图，确保旋转平均的鲁棒性
+    // 边双连通性保证了即使删除任意一条边，图仍然连通
+    // 这对全局旋转估计的稳定性至关重要
     image_pairs = LargestBiconnectedGraph(image_pairs, covered_frames);
     LOG(INFO) << "after filter with graph connection: " << image_pairs.size() << " pairs, " << covered_frames.size() << " frames";
 
+    // === 步骤3：三元组一致性过滤 ===
+    // 使用三元组（triplet）一致性检查进一步过滤图像对
+    // 三元组一致性：对于三张图像A、B、C，R_AB * R_BC应该等于R_AC
+    // 这是一个重要的几何约束，可以检测和去除不一致的相对旋转
     image_pairs = FilterByTriplet(image_pairs, 0.1, covered_frames);
 
+    // === 调试输出（当前被注释） ===
     // PrintRelativePose(config.sfm_result_path + "relpose-RA.txt");
 
-
-    // 从以下就是正式开始旋转平均，之前的都是进行一些前期准备
+    // === 正式开始全局旋转估计 ===
     LOG(INFO) << "Global rotation estimation:\n" << "\t\tprepare to estimate " << covered_frames.size() << 
             " global rotations, with " << image_pairs.size() << " relative motion";
 
-    // 图像对的id进行重新映射
-    map<size_t, size_t> old_to_new, new_to_old;
+    // === 步骤4：重新索引图像ID ===
+    // 为了算法效率，将图像ID重新映射为连续的0,1,2,...
+    // 这样可以使用数组而不是map来存储结果，提高访问效率
+    map<size_t, size_t> old_to_new, new_to_old;  // 双向映射表
     ReIndex(image_pairs ,old_to_new, new_to_old);
+    
+    // 更新所有图像对中的ID为新的连续ID
     for(MatchPair& pair : image_pairs)
     {
         pair.image_pair.first = old_to_new[pair.image_pair.first];
         pair.image_pair.second = old_to_new[pair.image_pair.second];
     }
-    // 计算全局的旋转
+    
+    // === 步骤5：执行全局旋转估计 ===
+    // 创建全局旋转数组，大小等于参与估计的图像数量
     eigen_vector<Eigen::Matrix3d> global_rotations(old_to_new.size());
     bool success;
+    
+    // 根据选择的方法执行不同的旋转平均算法
     if(method == ROTATION_AVERAGING_L2)
     {
+        // === L2旋转平均 ===
         LOG(INFO) << "Rotation averaging L2 begin";
+        
+        // 首先使用最小二乘法获得初始估计
+        // 这个方法速度快，但对外点敏感
         if(!RotationAveragingLeastSquare(image_pairs, global_rotations))
         {
             LOG(ERROR) << "Rotation averaging L2 failed";
             return false;
         }
+        
+        // 然后使用迭代的L2方法进行精化
+        // 这个方法考虑了旋转群的几何结构，结果更精确
         if(!RotationAveragingL2(config.num_threads, image_pairs, global_rotations))
             LOG(ERROR) << "Rotation averaging refine L2 failed";
     }
     else if (method == ROTATION_AVERAGING_L1)
     {
+        // === L1旋转平均 ===
         LOG(INFO) << "Rotation averaging L1 begin";
+        
+        // L1旋转平均对外点更鲁棒，但计算复杂度更高
+        // 参数：图像对、输出旋转、起始索引、结束索引(-1表示全部)
         if(!RotationAveragingL1(image_pairs, global_rotations, 0, -1))
         {
             LOG(ERROR) << "Rotation averaging L1 failed";
@@ -877,29 +1318,45 @@ bool SfM::EstimateGlobalRotation(const int method)
         }
         
         #if 0
-        // global rotation 算出来的是 R_cw, frame里保存的是 R_wc
+        // === 中间结果调试输出（当前被注释） ===
+        // global rotation 算出来的是 R_cw (相机到世界)，frame里保存的是 R_wc (世界到相机)
         for(size_t i = 0; i < global_rotations.size(); i++)
             frames[new_to_old[i]].SetRotation(global_rotations[i].transpose());
         PrintGlobalPose(config.sfm_result_path + "frame_pose-after-L1.txt");
         #endif
 
+        // L1之后再用L2进行精化
+        // 结合两种方法的优点：L1的鲁棒性 + L2的精度
         if(!RotationAveragingL2(config.num_threads, image_pairs, global_rotations))
             LOG(ERROR) << "Rotation averaging refine L2 failed";
     }
-    // 用全局旋转更新图像对之间的相对旋转，因为后面的平移平均可能会用到相对旋转
+    
+    // === 步骤6：更新相对旋转和ID映射 ===
+    // 用估计出的全局旋转更新图像对之间的相对旋转
+    // 这对后续的平移平均算法很重要
     for(MatchPair& pair : image_pairs)
     {
-        const Eigen::Matrix3d& R_1w = global_rotations[pair.image_pair.first];
-        const Eigen::Matrix3d& R_2w = global_rotations[pair.image_pair.second];
-        pair.R_21 = R_2w * R_1w.transpose();
+        // 从全局旋转计算相对旋转
+        // R_21 = R_2w * R_1w^T，表示从相机1到相机2的旋转
+        const Eigen::Matrix3d& R_1w = global_rotations[pair.image_pair.first];   // 相机1的全局旋转
+        const Eigen::Matrix3d& R_2w = global_rotations[pair.image_pair.second];  // 相机2的全局旋转
+        pair.R_21 = R_2w * R_1w.transpose();  // 计算相对旋转
+        
+        // 将图像ID还原为原始ID
         pair.image_pair.first = new_to_old[pair.image_pair.first];
         pair.image_pair.second = new_to_old[pair.image_pair.second];
     }
+    
+    // === 步骤7：更新Frame中的全局旋转 ===
     for(size_t i = 0; i < global_rotations.size(); i++)
     {
-        // global rotation 算出来的是 R_cw, frame里保存的是 R_wc
+        // 注意坐标系转换：
+        // global rotation算出来的是R_cw（相机坐标系到世界坐标系）
+        // 但Frame里保存的是R_wc（世界坐标系到相机坐标系）
+        // 所以需要转置：R_wc = R_cw^T
         frames[new_to_old[i]].SetRotation(global_rotations[i].transpose());
     }
+    
     LOG(INFO) << "===================== Estimate Global Rotation end ===============";
     return true;
 }
