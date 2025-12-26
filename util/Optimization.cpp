@@ -7,78 +7,169 @@
 
 using namespace std;
 
+/**
+ * [功能描述]：SfM全局束集调整的核心实现函数
+ * 
+ * 这是Bundle Adjustment的具体实现，使用Ceres Solver进行大规模非线性优化：
+ * - 同时优化所有相机的位姿参数（旋转和平移）
+ * - 同时优化所有3D点的空间坐标
+ * - 最小化所有观测的重投影误差总和
+ * - 解决大规模稀疏非线性最小二乘问题
+ * 
+ * @param frames [输入/输出]：所有图像帧的引用，包含相机位姿（会被更新）
+ * @param tracks [输入/输出]：所有3D点轨迹的引用，包含3D坐标（会被更新）
+ * @param residual_type [输入]：残差计算类型（像素残差/角度残差）
+ * @param num_threads [输入]：并行优化使用的线程数
+ * @param refine_structure [输入]：是否优化3D点坐标
+ * @param refine_rotation [输入]：是否优化相机旋转
+ * @param refine_translation [输入]：是否优化相机平移
+ * @return：优化是否成功
+ */
 bool SfMGlobalBA(std::vector<Frame>& frames, std::vector<PointTrack>& tracks, int residual_type,
                     int num_threads, bool refine_structure, bool refine_rotation, bool refine_translation)
 {
+    // === 步骤1：参数有效性检查 ===
+    // 确保至少有一类参数需要被优化，否则优化问题没有意义
     if(refine_structure == false && refine_rotation == false && refine_translation == false)
     {
         LOG(ERROR) << "Structure, rotation and translation all set constant, can not BA";
         return false;
     }
+    
+    // === 步骤2：准备优化变量 ===
+    // Bundle Adjustment需要将相机位姿转换为优化友好的参数化形式
+    
+    // 存储3D点的世界坐标（这些会直接被优化）
     eigen_vector<Eigen::Vector3d> point_world;
+    
+    // 存储相机旋转的轴角表示（Rodrigues参数）
+    // 轴角表示是3维向量，比旋转矩阵（9维）或四元数（4维带约束）更适合优化
     eigen_vector<Eigen::Vector3d> angleAxis_cw_list(frames.size(), Eigen::Vector3d::Zero());
+    
+    // 存储相机的平移向量（从相机坐标系到世界坐标系）
     eigen_vector<Eigen::Vector3d> t_cw_list(frames.size(), Eigen::Vector3d::Zero());
+    
+    // === 步骤3：转换相机位姿参数化 ===
+    // 将Frame中存储的T_wc（世界到相机）转换为T_cw（相机到世界）
+    // Ceres优化中通常使用相机到世界的变换更方便
     for(size_t i = 0; i < frames.size(); i++)
     {
+        // 跳过无效的相机位姿
         if(!frames[i].IsPoseValid())
             continue;
+            
+        // 获取相机到世界的变换矩阵T_cw = T_wc^(-1)
         Eigen::Matrix4d T_cw = frames[i].GetPose().inverse();
+        
+        // 提取平移部分
         const Eigen::Vector3d t_cw = T_cw.block<3,1>(0,3);
         t_cw_list[i] = t_cw;
+        
+        // 提取旋转部分并转换为轴角表示
         const Eigen::Matrix3d R_cw = T_cw.block<3,3>(0,0);
+        // Ceres提供的工具函数：旋转矩阵 -> 轴角向量
+        // 轴角表示：向量方向表示旋转轴，向量长度表示旋转角度
         ceres::RotationMatrixToAngleAxis(R_cw.data(), angleAxis_cw_list[i].data());
     }
         
+    // === 步骤4：构建优化问题 ===
     ceres::Problem problem;
-    // 向带求解问题中加入残差项
+    
+    // 向优化问题中添加残差项（代价函数）
+    // 这是BA的核心：为每个观测（特征点在图像中的位置）创建重投影误差项
+    // AddCameraResidual函数会：
+    // 1. 遍历所有3D点轨迹
+    // 2. 为每个轨迹中的每个观测创建一个残差项
+    // 3. 残差 = |投影位置 - 观测位置|（像素残差）或角度差（角度残差）
     AddCameraResidual(frames, angleAxis_cw_list, t_cw_list, tracks, problem, residual_type);
-    // 根据选项固定旋转、平移、空间点
+    
+    // === 步骤5：设置优化约束 ===
+    // 根据用户选择，固定某些参数不参与优化
+    
+    // 处理相机位姿参数的约束
     for(size_t i = 0; i < frames.size(); i++)
     {
         if(!frames[i].IsPoseValid())
             continue;
+            
+        // 如果不优化旋转，则将旋转参数设为常量
         if(!refine_rotation)
             problem.SetParameterBlockConstant(angleAxis_cw_list[i].data());
+            
+        // 如果不优化平移，则将平移参数设为常量  
         if(!refine_translation)
             problem.SetParameterBlockConstant(t_cw_list[i].data());
     }
+    
+    // 如果不优化3D结构，则将所有3D点坐标设为常量
     if(!refine_structure)
         for(size_t i = 0; i < tracks.size(); i++)
             problem.SetParameterBlockConstant(tracks[i].point_3d.data());
 
-    // 找到第一个可用的位姿并把它设置为固定
+    // === 步骤6：固定参考坐标系 ===
+    // BA问题存在7个自由度的模糊性（3个旋转+3个平移+1个尺度）
+    // 需要固定一个相机位姿作为世界坐标系的参考，消除这种模糊性
+    // 找到第一个有效位姿的相机并将其完全固定
     for(size_t i = 0; i < frames.size(); i++)
     {
         if(!frames[i].IsPoseValid())
             continue;
+        // 固定第一个有效相机的旋转和平移，作为世界坐标系原点
         problem.SetParameterBlockConstant(angleAxis_cw_list[i].data());
         problem.SetParameterBlockConstant(t_cw_list[i].data());
-        break;
+        break;  // 只固定第一个，其他相机位姿可以自由优化
     }
 
+    // === 步骤7：配置求解器选项 ===
+    // 设置Ceres求解器的参数：线程数、迭代次数、收敛条件等
     ceres::Solver::Options options = SetOptionsSfM(num_threads);
-    ceres::Solver::Summary summary;
+    
+    // === 步骤8：执行非线性优化 ===
+    ceres::Solver::Summary summary;  // 存储优化结果摘要
+    
+    // 调用Ceres求解器执行优化
+    // 这里会运行Levenberg-Marquardt算法或其他非线性优化算法
+    // 迭代地调整所有参数，最小化总的重投影误差
     ceres::Solve(options, &problem, &summary);
+    
+    // === 步骤9：检查优化结果 ===
     if (!summary.IsSolutionUsable())
     {
+        // 优化失败：可能原因包括数值不稳定、初值太差、约束不足等
         LOG(INFO) << summary.BriefReport();
         return false;
     }
+    
+    // 输出优化统计信息：迭代次数、最终误差、计算时间等
     LOG(INFO) << summary.BriefReport();
-    // 更新相机位姿
+    
+    // === 步骤10：更新优化结果 ===
+    // 将优化后的参数转换回Frame对象中的位姿表示
     for(size_t i = 0; i < frames.size(); i++)
     {
         if(!frames[i].IsPoseValid())
             continue;
+            
+        // 将轴角表示转换回旋转矩阵
         Eigen::Matrix3d R_cw;
         ceres::AngleAxisToRotationMatrix(angleAxis_cw_list[i].data(), R_cw.data());
+        
+        // 获取优化后的平移向量
         Eigen::Vector3d t_cw = t_cw_list[i];
+        
+        // 重构变换矩阵T_cw
         Eigen::Matrix4d T_cw = Eigen::Matrix4d::Identity();
-        T_cw.block<3,3>(0,0) = R_cw;
-        T_cw.block<3,1>(0,3) = t_cw;
+        T_cw.block<3,3>(0,0) = R_cw;      // 设置旋转部分
+        T_cw.block<3,1>(0,3) = t_cw;      // 设置平移部分
+        
+        // 转换回T_wc格式并更新Frame
+        // T_wc = T_cw^(-1)
         frames[i].SetPose(T_cw.inverse());
     }
-    return true;
+    
+    // 注意：tracks中的3D点坐标会被Ceres直接修改，无需额外更新
+    
+    return true;  // 优化成功完成
 }
 
 bool SfMLocalBA(const Frame& frame1, const Frame& frame2, int residual_type, MatchPair& image_pair)

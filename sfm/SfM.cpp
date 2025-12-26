@@ -1816,27 +1816,76 @@ bool SfM::EstimateStructure()
     return true;
 }
 
+/**
+ * [功能描述]：执行全局束集调整(Global Bundle Adjustment)
+ * 
+ * Bundle Adjustment是SfM中的核心优化步骤：
+ * - 同时优化所有相机位姿参数和3D点位置
+ * - 最小化重投影误差，提高重建精度
+ * - 通过非线性最小二乘法求解大规模稀疏优化问题
+ * 
+ * @param residual_type [输入]：残差计算类型
+ *        - ANGLE_RESIDUAL_1/2: 使用角度残差（球面坐标系下的角度误差）
+ *        - PIXEL_RESIDUAL: 使用像素残差（图像平面上的像素误差）
+ * @param redisual_threshold [输入]：残差过滤阈值
+ *        - 超过此阈值的观测点将被标记为外点并过滤掉
+ *        - 单位取决于residual_type（角度用弧度，像素用像素）
+ * @param refine_structure [输入]：是否优化3D点坐标
+ *        - true: 同时优化相机位姿和3D点位置（完整BA）
+ *        - false: 只优化相机位姿，固定3D点位置（位姿优化）
+ * @param refine_rotation [输入]：是否优化相机旋转参数
+ *        - 在某些情况下可能只想优化平移而固定旋转
+ * @param refine_translation [输入]：是否优化相机平移参数
+ *        - 在某些情况下可能只想优化旋转而固定平移
+ * @return：优化是否成功完成
+ */
 bool SfM::GlobalBundleAdjustment(int residual_type, float redisual_threshold, bool refine_structure, bool refine_rotation, bool refine_translation)
 {
+    // === 步骤1：执行全局束集调整优化 ===
+    // 调用核心的全局BA算法，同时优化所有相机位姿和3D结构
+    // SfMGlobalBA是实际执行优化的函数，使用Ceres Solver等优化库
+    // 参数说明：
+    // - frames: 所有图像帧，包含相机位姿和特征点信息
+    // - structure: 所有3D点轨迹，包含3D坐标和观测信息
+    // - residual_type: 残差计算方式（像素残差 vs 角度残差）
+    // - config.num_threads: 并行优化的线程数
+    // - refine_structure/rotation/translation: 控制优化哪些参数
     if(!SfMGlobalBA(frames, structure, residual_type, 
                     config.num_threads, refine_structure, refine_rotation, refine_translation))
     {
+        // 如果BA优化失败，记录错误并返回false
+        // 失败原因可能包括：数值不稳定、初值太差、约束不足等
         LOG(ERROR) << "Global BA failed";
         return false;
     }
-    size_t num_filter;
+    
+    // === 步骤2：基于残差过滤低质量的3D点轨迹 === 
+    size_t num_filter;  // 记录被过滤掉的点轨迹数量
+    
+    // 根据残差类型选择对应的过滤方法
     if(residual_type == RESIDUAL_TYPE::ANGLE_RESIDUAL_1 || residual_type == RESIDUAL_TYPE::ANGLE_RESIDUAL_2)
     {
+        // === 角度残差过滤 ===
+        // 适用于全景相机或鱼眼相机等大视野相机
+        // 角度残差衡量的是：3D点投影到单位球面上的方向 与 实际观测方向 之间的夹角
+        // 这种残差在处理大畸变图像时比像素残差更稳定和准确
         num_filter = FilterTracksAngleResidual(frames, structure, redisual_threshold);
         LOG(INFO) << "Filter " << num_filter << " tracks by angle residual, " << structure.size() << " points left";
     }
     else if(residual_type == RESIDUAL_TYPE::PIXEL_RESIDUAL)
     {
+        // === 像素残差过滤 ===
+        // 适用于针孔相机模型
+        // 像素残差衡量的是：3D点投影到图像平面的位置 与 实际特征点位置 之间的欧氏距离
+        // 这是最常见的残差类型，直观易懂，适用于大多数相机
         num_filter = FilterTracksPixelResidual(frames, structure, redisual_threshold);
         LOG(INFO) << "Filter " << num_filter << " tracks by pixel residual, " << structure.size() << " points left";
     }
-    return true;
     
+    // === 步骤3：返回成功标志 ===
+    // 执行到这里说明BA优化和后处理都成功完成
+    // 此时相机位姿和3D结构都已经得到精化，重投影误差得到最小化
+    return true;
 }
 
 bool SfM::SetToOrigin(size_t frame_idx)
